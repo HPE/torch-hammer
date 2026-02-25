@@ -635,7 +635,7 @@ rows.  The normal multi-GPU summary table is suppressed — the CSV **is** the
 summary.
 
 ```bash
-./torch-hammer.py --compact --all-gpus --batched-gemm > fleet.csv
+./torch-hammer.py --compact --all-gpus --batched-gemm > results.csv
 ```
 
 ### Behaviour Notes
