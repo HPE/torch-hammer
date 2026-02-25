@@ -1375,7 +1375,53 @@ def _format_telemetry_compact(tel_data: Dict[str, Any]) -> str:
     return " | ".join(parts)
 
 
-def _log_summary(name, vals, unit, logger, tel, device, params=None, baselines=None, verbose=False, skip_telemetry=10, tel_thread=None):
+# ───────────────────────────────────────────────────────────────────────
+# 4a′. COMPACT CSV HELPERS  ────────────────────────────────────────────
+
+def _compact_csv_columns(verbose: bool = False) -> list:
+    """Return ordered column names for compact CSV output.
+
+    Base columns (14):
+        hostname, gpu, gpu_model, serial, benchmark, dtype, iterations,
+        runtime_s, min, mean, max, unit, power_avg_w, temp_max_c
+
+    With --verbose (19): appends sm_util_mean, mem_bw_util_mean,
+        gpu_clock_mean, mem_used_gb_mean, throttled
+    """
+    cols = [
+        "hostname", "gpu", "gpu_model", "serial",
+        "benchmark", "dtype", "iterations", "runtime_s",
+        "min", "mean", "max", "unit",
+        "power_avg_w", "temp_max_c",
+    ]
+    if verbose:
+        cols += [
+            "sm_util_mean", "mem_bw_util_mean",
+            "gpu_clock_mean", "mem_used_gb_mean", "throttled",
+        ]
+    return cols
+
+
+def _emit_compact_csv(row: dict, verbose: bool = False,
+                      header: bool = False, file=None) -> None:
+    """Print a single compact CSV row (and optional header) to *file*.
+
+    *file* defaults to ``sys.stdout`` so that CSV data always goes to
+    stdout even when the logging framework is redirected to stderr or a
+    log file.
+    """
+    import csv, io
+    out = file or sys.stdout
+    cols = _compact_csv_columns(verbose)
+    if header:
+        print(",".join(cols), file=out, flush=True)
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
+    writer.writerow({c: row.get(c, "") for c in cols})
+    print(buf.getvalue().rstrip("\r\n"), file=out, flush=True)
+
+
+def _log_summary(name, vals, unit, logger, tel, device, params=None, baselines=None, verbose=False, skip_telemetry=10, tel_thread=None, runtime_s=None):
     s = dict(min=min(vals), mean=statistics.mean(vals), max=max(vals))
     tel_data = tel.read()
     tel_stats = tel.get_stats(skip_first_n=skip_telemetry)
@@ -1419,6 +1465,8 @@ def _log_summary(name, vals, unit, logger, tel, device, params=None, baselines=N
         'mean': s['mean'],
         'max': s['max'],
         'unit': unit,
+        'iterations': len(vals),
+        'runtime_s': round(runtime_s, 3) if runtime_s is not None else None,
         'params': params or {},  # Include test parameters
         'telemetry': tel_stats or {},  # Include telemetry stats for this benchmark
         'iteration_telemetry': iteration_telemetry  # Per-iteration telemetry with perf + timestamp
@@ -2161,7 +2209,7 @@ def batched_gemm_test(a, dev, log, tel, tel_thread, prn):
             'tf32': a.batched_gemm_TF32_mode if dev.type == "cuda" else False
         }
         baselines = getattr(a, '_hardware_baselines', None)
-        return _log_summary("Batched GEMM", vals, "GFLOP/s", log, tel, dev, params, baselines, verbose=a.verbose, skip_telemetry=a.skip_telemetry_first_n, tel_thread=tel_thread)
+        return _log_summary("Batched GEMM", vals, "GFLOP/s", log, tel, dev, params, baselines, verbose=a.verbose, skip_telemetry=a.skip_telemetry_first_n, tel_thread=tel_thread, runtime_s=time.perf_counter() - start_time)
     except Exception as e:
         dev_label_str = device_label(dev, gpu_id)
         log.error(f"[{dev_label_str} Batched GEMM] Failed: {e}")
@@ -2232,7 +2280,7 @@ def convolution_test(a, dev, log, tel, tel_thread, prn):
             'kernel': K
         }
         baselines = getattr(a, '_hardware_baselines', None)
-        return _log_summary("Convolution", vals, "img/s", log, tel, dev, params, baselines, verbose=a.verbose, skip_telemetry=a.skip_telemetry_first_n, tel_thread=tel_thread)
+        return _log_summary("Convolution", vals, "img/s", log, tel, dev, params, baselines, verbose=a.verbose, skip_telemetry=a.skip_telemetry_first_n, tel_thread=tel_thread, runtime_s=time.perf_counter() - start_time)
     except Exception as e:
         dev_label_str = device_label(dev, gpu_id)
         log.error(f"[{dev_label_str} Convolution] Failed: {e}")
@@ -2297,7 +2345,7 @@ def fft_test(a, dev, log, tel, tel_thread, prn):
             'nz': NZ
         }
         baselines = getattr(a, '_hardware_baselines', None)
-        return _log_summary("3D FFT", vals, "GFLOP/s", log, tel, dev, params, baselines, verbose=a.verbose, skip_telemetry=a.skip_telemetry_first_n, tel_thread=tel_thread)
+        return _log_summary("3D FFT", vals, "GFLOP/s", log, tel, dev, params, baselines, verbose=a.verbose, skip_telemetry=a.skip_telemetry_first_n, tel_thread=tel_thread, runtime_s=time.perf_counter() - start_time)
     except Exception as e:
         dev_label_str = device_label(dev, gpu_id)
         log.error(f"[{dev_label_str} 3-D FFT] Failed: {e}")
@@ -2361,7 +2409,7 @@ def einsum_test(a, dev, log, tel, tel_thread, prn):
             'head_dim': D
         }
         baselines = getattr(a, '_hardware_baselines', None)
-        return _log_summary("Einsum Attention", vals, "GFLOP/s", log, tel, dev, params, baselines, verbose=a.verbose, skip_telemetry=a.skip_telemetry_first_n, tel_thread=tel_thread)
+        return _log_summary("Einsum Attention", vals, "GFLOP/s", log, tel, dev, params, baselines, verbose=a.verbose, skip_telemetry=a.skip_telemetry_first_n, tel_thread=tel_thread, runtime_s=time.perf_counter() - start_time)
     except Exception as e:
         dev_label_str = device_label(dev, gpu_id)
         log.error(f"[{dev_label_str} Einsum] Failed: {e}")
@@ -2444,7 +2492,7 @@ def memory_traffic_test(a, dev, log, tel, tel_thread, prn):
             'iterations': ITR
         }
         baselines = getattr(a, '_hardware_baselines', None)
-        return _log_summary("Memory Traffic", vals, "GB/s", log, tel, dev, params, baselines, verbose=a.verbose, skip_telemetry=a.skip_telemetry_first_n, tel_thread=tel_thread)
+        return _log_summary("Memory Traffic", vals, "GB/s", log, tel, dev, params, baselines, verbose=a.verbose, skip_telemetry=a.skip_telemetry_first_n, tel_thread=tel_thread, runtime_s=time.perf_counter() - start_time)
     except Exception as e:
         log.error(f"[{dev_lbl} Memory traffic] Failed: {e}")
         import traceback
@@ -2512,7 +2560,7 @@ def laplacian_heat_equation(a, dev, log, tel, tel_thread, prn):
             'delta_t': a.delta_t
         }
         baselines = getattr(a, '_hardware_baselines', None)
-        return _log_summary("Heat Equation", vals, "MLUPS", log, tel, dev, params, baselines, verbose=a.verbose, skip_telemetry=a.skip_telemetry_first_n, tel_thread=tel_thread)
+        return _log_summary("Heat Equation", vals, "MLUPS", log, tel, dev, params, baselines, verbose=a.verbose, skip_telemetry=a.skip_telemetry_first_n, tel_thread=tel_thread, runtime_s=time.perf_counter() - start_time)
     except Exception as e:
         log.error(f"[{dev_lbl} Heat Equation] Failed: {e}")
         import traceback
@@ -2580,7 +2628,7 @@ def schrodinger_equation(a, dev, log, tel, tel_thread, prn):
             'potential': a.schrodinger_potential
         }
         baselines = getattr(a, '_hardware_baselines', None)
-        return _log_summary("Schrödinger Equation", vals, "iter/s", log, tel, dev, params, baselines, verbose=a.verbose, skip_telemetry=a.skip_telemetry_first_n, tel_thread=tel_thread)
+        return _log_summary("Schrödinger Equation", vals, "iter/s", log, tel, dev, params, baselines, verbose=a.verbose, skip_telemetry=a.skip_telemetry_first_n, tel_thread=tel_thread, runtime_s=time.perf_counter() - start_time)
     except Exception as e:
         log.error(f"[{dev_lbl} Schrödinger Equation] Failed: {e}")
         import traceback
@@ -2698,7 +2746,7 @@ def atomic_contention_test(a, dev, log, tel, tel_thread, prn):
         }
         baselines = getattr(a, '_hardware_baselines', None)
         return _log_summary("Atomic Contention", vals, "Mops/s", log, tel, dev, params, baselines, 
-                           verbose=a.verbose, skip_telemetry=a.skip_telemetry_first_n, tel_thread=tel_thread)
+                           verbose=a.verbose, skip_telemetry=a.skip_telemetry_first_n, tel_thread=tel_thread, runtime_s=time.perf_counter() - start_time)
     except Exception as e:
         log.error(f"[{dev_lbl} Atomic Contention] Failed: {e}")
         import traceback
@@ -2842,7 +2890,7 @@ def sparse_mm_test(a, dev, log, tel, tel_thread, prn):
         }
         baselines = getattr(a, '_hardware_baselines', None)
         return _log_summary("Sparse MM", vals, "GFLOP/s", log, tel, dev, params, baselines,
-                           verbose=a.verbose, skip_telemetry=a.skip_telemetry_first_n, tel_thread=tel_thread)
+                           verbose=a.verbose, skip_telemetry=a.skip_telemetry_first_n, tel_thread=tel_thread, runtime_s=time.perf_counter() - start_time)
     except Exception as e:
         log.error(f"[{dev_lbl} Sparse MM] Failed: {e}")
         import traceback
@@ -2981,6 +3029,7 @@ def build_parser():
     p.add_argument("--temp-dir", type=str, help="Directory for temp files (multi-GPU result collection). Falls back to TORCH_HAMMER_TEMP_DIR env var, then system temp.")
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--verbose-file-only", action="store_true", help="With --verbose and --log-file/--log-dir, suppress stdout (file only)")
+    p.add_argument("--compact", action="store_true", help="Machine-readable CSV output to stdout (one row per benchmark). Suppresses normal log chatter. Combine with --verbose for extra telemetry columns.")
     p.add_argument("--dry-run", action="store_true", help="Show configuration and exit without running benchmarks")
     p.add_argument("--repeats", type=int, default=1, help="Number of times to repeat the entire benchmark suite")
     p.add_argument("--repeat-delay", type=float, default=0, help="Delay in seconds between repeats (for thermal stabilization)")
@@ -3109,12 +3158,21 @@ def init_logging(a, gpu_index=None, tel_data=None):
     if a.verbose_file_only:
         a.verbose = True
     
-    level = logging.DEBUG if a.verbose else logging.INFO
+    # Compact mode: suppress normal log output (CSV goes to stdout separately).
+    # Use WARNING so only real problems appear on stderr.
+    compact = getattr(a, 'compact', False)
+    if compact:
+        level = logging.WARNING
+    else:
+        level = logging.DEBUG if a.verbose else logging.INFO
     # Determine handlers based on log file settings
     handlers = []
     
+    # In compact mode route log messages to stderr so stdout stays pure CSV
+    if compact:
+        handlers.append(logging.StreamHandler(sys.stderr))
     # Add stdout handler unless --verbose-file-only is set
-    if not a.verbose_file_only:
+    elif not a.verbose_file_only:
         handlers.append(logging.StreamHandler(sys.stdout))
     
     # Per-GPU log files for multi-GPU runs
@@ -3184,6 +3242,8 @@ def run_single_gpu(args, gpu_index: int, log=None):
     """Run benchmarks on a single device (GPU, MPS, or CPU) with optional CPU affinity."""
     import sys
     
+    _quiet = getattr(args, 'compact', False)
+    
     # Determine device type early for proper labeling
     # (Before we have the actual torch.device object)
     if torch.cuda.is_available():
@@ -3198,11 +3258,13 @@ def run_single_gpu(args, gpu_index: int, log=None):
     startup_delay = getattr(args, 'startup_delay_per_gpu', 0)
     if startup_delay > 0 and early_label.startswith("GPU"):
         delay = gpu_index * startup_delay
-        print(f"[{early_label}] Waiting {delay:.1f}s (staggered startup)...", file=sys.stderr, flush=True)
+        if not _quiet:
+            print(f"[{early_label}] Waiting {delay:.1f}s (staggered startup)...", file=sys.stderr, flush=True)
         time.sleep(delay)
     
     # Early progress message (before logging is set up)
-    print(f"[{early_label}] Initializing...", file=sys.stderr, flush=True)
+    if not _quiet:
+        print(f"[{early_label}] Initializing...", file=sys.stderr, flush=True)
     
     # Set unique process name for identification in ps/top/htop
     if SETPROCTITLE_AVAILABLE:
@@ -3212,7 +3274,8 @@ def run_single_gpu(args, gpu_index: int, log=None):
         setproctitle.setproctitle(f"torch-hammer-{proc_suffix}@{hostname}")
     
     # Set up device first
-    print(f"[{early_label}] Setting up PyTorch device...", file=sys.stderr, flush=True)
+    if not _quiet:
+        print(f"[{early_label}] Setting up PyTorch device...", file=sys.stderr, flush=True)
     if torch.cuda.is_available():
         dev = torch.device(f"cuda:{gpu_index}")
         torch.cuda.set_device(gpu_index)
@@ -3225,7 +3288,8 @@ def run_single_gpu(args, gpu_index: int, log=None):
     dev_label = device_label(dev, gpu_index)
     
     # Get telemetry data early for log filename generation
-    print(f"[{dev_label}] Initializing telemetry...", file=sys.stderr, flush=True)
+    if not _quiet:
+        print(f"[{dev_label}] Initializing telemetry...", file=sys.stderr, flush=True)
     tel = make_telemetry(gpu_index, dev)
     tel_data = tel.read()
     
@@ -3238,7 +3302,8 @@ def run_single_gpu(args, gpu_index: int, log=None):
     if dev.type == "cpu":
         setup_cpu_threading(dev, args, log)
     
-    print(f"[{dev_label}] Ready.", file=sys.stderr, flush=True)
+    if not _quiet:
+        print(f"[{dev_label}] Ready.", file=sys.stderr, flush=True)
     
     log.info(f"Using device {dev}")
     log.info(f"Initial telemetry: {_format_telemetry_compact(tel_data)}")
@@ -3434,6 +3499,50 @@ def run_single_gpu(args, gpu_index: int, log=None):
         return
 
     benchmark_results = []
+    
+    # ── compact-mode helpers (closure over tel_data, args, gpu_index) ──
+    _compact = getattr(args, 'compact', False)
+    _compact_header_needed = _compact  # emit header before first row
+    _is_single = (not getattr(args, 'all_gpus', False)
+                  and not getattr(args, 'gpu_list', None))
+    
+    def _maybe_emit_compact(perf):
+        """If --compact, emit a CSV row for the just-finished benchmark."""
+        nonlocal _compact_header_needed
+        if not _compact or perf is None:
+            return
+        import socket
+        hostname = tel_data.get('hostname') or socket.gethostname().split('.', 1)[0]
+        tel_s = perf.get('telemetry', {})
+        row = {
+            'hostname':       hostname,
+            'gpu':            gpu_index,
+            'gpu_model':      tel_data.get('model', ''),
+            'serial':         tel_data.get('serial', ''),
+            'benchmark':      perf['name'],
+            'dtype':          perf.get('params', {}).get('dtype', ''),
+            'iterations':     perf.get('iterations', ''),
+            'runtime_s':      perf.get('runtime_s', ''),
+            'min':            f"{perf['min']:.4f}",
+            'mean':           f"{perf['mean']:.4f}",
+            'max':            f"{perf['max']:.4f}",
+            'unit':           perf['unit'],
+            'power_avg_w':    f"{tel_s.get('power_W_mean', 0):.1f}" if tel_s.get('power_W_mean') else '',
+            'temp_max_c':     f"{tel_s.get('temp_gpu_C_max', 0):.0f}" if tel_s.get('temp_gpu_C_max') else '',
+        }
+        if args.verbose:
+            row.update({
+                'sm_util_mean':     f"{tel_s['sm_util_mean']:.0f}" if 'sm_util_mean' in tel_s else '',
+                'mem_bw_util_mean': f"{tel_s['mem_bw_util_mean']:.0f}" if 'mem_bw_util_mean' in tel_s else '',
+                'gpu_clock_mean':   f"{tel_s['gpu_clock_mean']:.0f}" if 'gpu_clock_mean' in tel_s else '',
+                'mem_used_gb_mean': f"{tel_s['mem_used_MB_mean'] / 1024:.2f}" if 'mem_used_MB_mean' in tel_s else '',
+                'throttled':        'true' if perf.get('throttled') else 'false',
+            })
+        # In single-GPU mode each process handles its own header;
+        # in multi-GPU mode the parent emits the header before spawning.
+        _emit_compact_csv(row, verbose=args.verbose,
+                          header=(_compact_header_needed and _is_single))
+        _compact_header_needed = False
     
     # Repeat loop for running benchmark suite multiple times
     for repeat_num in range(1, args.repeats + 1):
@@ -3719,6 +3828,9 @@ def run_single_gpu(args, gpu_index: int, log=None):
                     log.warning(f"Unknown benchmark name '{bench_name}' in config file (benchmark #{idx+1}). Valid names: batched_gemm, convolution, fft, einsum, memory_traffic, heat_equation, schrodinger, atomic_contention, sparse_mm")
                     continue
                 
+                # Emit compact CSV row (if --compact) before restoring params
+                _maybe_emit_compact(perf)
+                
                 # Restore original values after each benchmark
                 for key, value in original_values.items():
                     setattr(args, key, value)
@@ -3728,38 +3840,47 @@ def run_single_gpu(args, gpu_index: int, log=None):
             if args.batched_gemm:
                 tel.reset_stats()  # Per-benchmark telemetry isolation
                 perf = batched_gemm_test(args, dev, log, tel, tel_thread, prn)
+                _maybe_emit_compact(perf)
                 benchmark_results.append(perf) if perf else None
             if args.convolution:
                 tel.reset_stats()  # Per-benchmark telemetry isolation
                 perf = convolution_test(args, dev, log, tel, tel_thread, prn)
+                _maybe_emit_compact(perf)
                 benchmark_results.append(perf) if perf else None
             if args.fft:
                 tel.reset_stats()  # Per-benchmark telemetry isolation
                 perf = fft_test(args, dev, log, tel, tel_thread, prn)
+                _maybe_emit_compact(perf)
                 benchmark_results.append(perf) if perf else None
             if args.einsum:
                 tel.reset_stats()  # Per-benchmark telemetry isolation
                 perf = einsum_test(args, dev, log, tel, tel_thread, prn)
+                _maybe_emit_compact(perf)
                 benchmark_results.append(perf) if perf else None
             if args.memory_traffic:
                 tel.reset_stats()  # Per-benchmark telemetry isolation
                 perf = memory_traffic_test(args, dev, log, tel, tel_thread, prn)
+                _maybe_emit_compact(perf)
                 benchmark_results.append(perf) if perf else None
             if args.heat_equation:
                 tel.reset_stats()  # Per-benchmark telemetry isolation
                 perf = laplacian_heat_equation(args, dev, log, tel, tel_thread, prn)
+                _maybe_emit_compact(perf)
                 benchmark_results.append(perf) if perf else None
             if args.schrodinger:
                 tel.reset_stats()  # Per-benchmark telemetry isolation
                 perf = schrodinger_equation(args, dev, log, tel, tel_thread, prn)
+                _maybe_emit_compact(perf)
                 benchmark_results.append(perf) if perf else None
             if args.atomic_contention:
                 tel.reset_stats()  # Per-benchmark telemetry isolation
                 perf = atomic_contention_test(args, dev, log, tel, tel_thread, prn)
+                _maybe_emit_compact(perf)
                 benchmark_results.append(perf) if perf else None
             if args.sparse_mm:
                 tel.reset_stats()  # Per-benchmark telemetry isolation
                 perf = sparse_mm_test(args, dev, log, tel, tel_thread, prn)
+                _maybe_emit_compact(perf)
                 benchmark_results.append(perf) if perf else None
     
     # End of repeat loop
@@ -3958,6 +4079,12 @@ def main():
         
         log.info(f"Launching {len(gpu_indices)} parallel processes...")
         
+        # In compact mode, emit the CSV header once from the parent process
+        # before workers start printing rows
+        if getattr(args, 'compact', False):
+            cols = _compact_csv_columns(args.verbose)
+            print(",".join(cols), flush=True)
+        
         # Use temp files for result collection to avoid IPC overhead on NUMA 0
         # Temp directory configurable via --temp-dir, TORCH_HAMMER_TEMP_DIR env var, or system default
         import tempfile
@@ -4010,8 +4137,8 @@ def main():
         # Sort by GPU index
         results = sorted(results, key=lambda x: x['gpu_index'])
     
-    # Display unified multi-GPU summary
-    if len(results) > 1:
+    # Display unified multi-GPU summary (skip in compact mode — CSV rows already emitted)
+    if len(results) > 1 and not getattr(args, 'compact', False):
         log.info("")
         log.info("="*80)
         log.info("MULTI-GPU SUMMARY")

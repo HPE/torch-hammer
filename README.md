@@ -191,6 +191,7 @@ The most important switches are summarised below (defaults in _italics_).
 | `--log-dir <path>` | Directory for per-GPU log files (multi-GPU runs). |
 | `--verbose` | One line per iteration (see examples). |
 | `--verbose-file-only` | With `--log-file` or `--log-dir`, suppress stdout (file only). |
+| `--compact` | Machine-readable CSV to stdout (one row per benchmark). See [Compact Mode](#compact-mode). |
 | `--banner` | Show ASCII banner at startup. |
 | `--json-output <path>` | Write all results and telemetry to a JSON file. |
 | `--summary-csv <path>` | Write benchmark summary table to a CSV file. |
@@ -575,6 +576,77 @@ Save it directly to a file via `--log-file myrun.txt`.
 
 ---
 
+## Compact Mode
+
+`--compact` produces **machine-readable CSV on stdout** — one row per benchmark,
+with all log chatter suppressed. 
+
+### Basic Usage
+
+```bash
+# CSV to stdout, warnings-only on stderr
+./torch-hammer.py --compact --batched-gemm --fft > results.csv
+
+# Pipe-friendly: only CSV reaches the file
+./torch-hammer.py --compact --batched-gemm --fft 2>/dev/null > results.csv
+```
+
+### Columns (14 base)
+
+| Column | Description |
+|--------|-------------|
+| `hostname` | Node hostname |
+| `gpu` | GPU index (0, 1, …) |
+| `gpu_model` | GPU model string |
+| `serial` | GPU serial number |
+| `benchmark` | Benchmark name (e.g. `Batched GEMM`) |
+| `dtype` | Data type used |
+| `iterations` | Number of timed iterations completed |
+| `runtime_s` | Wall-clock time for the timed loop (seconds) |
+| `min` | Minimum performance value |
+| `mean` | Mean performance value |
+| `max` | Maximum performance value |
+| `unit` | Performance unit (`GFLOP/s`, `GB/s`, etc.) |
+| `power_avg_w` | Average power draw (watts) |
+| `temp_max_c` | Peak GPU temperature (°C) |
+
+### Verbose Extras (`--compact --verbose`, 19 columns)
+
+Adding `--verbose` appends five telemetry columns:
+
+| Column | Description |
+|--------|-------------|
+| `sm_util_mean` | Mean SM / CU utilisation (%) |
+| `mem_bw_util_mean` | Mean memory-bandwidth utilisation (%) |
+| `gpu_clock_mean` | Mean GPU clock (MHz) |
+| `mem_used_gb_mean` | Mean memory used (GB) |
+| `throttled` | `true` / `false` — whether throttling was detected |
+
+```bash
+# 19-column CSV with extra telemetry
+./torch-hammer.py --compact --verbose --batched-gemm > detailed.csv
+```
+
+### Multi-GPU
+
+In multi-GPU mode (`--all-gpus` / `--gpu-list`) the parent process prints a
+single CSV header before spawning workers; each worker appends its own data
+rows.  The normal multi-GPU summary table is suppressed — the CSV **is** the
+summary.
+
+```bash
+./torch-hammer.py --compact --all-gpus --batched-gemm > fleet.csv
+```
+
+### Behaviour Notes
+
+- **stdout** = pure CSV (header + data rows).  
+- **stderr** = warnings / errors only (log level `WARNING`).  
+- `--compact` does **not** emit per-iteration lines; only `--verbose` does.  
+- Combine `--compact --verbose` to get extra telemetry **columns** on the summary row (not extra rows).
+
+---
+
 ## Telemetry Back-ends
 | Hardware | Requirements | Reported Fields* |
 |----------|--------------|------------------|
@@ -882,6 +954,7 @@ pytest tests/ -v
 
 # Run specific test categories
 pytest tests/test_parsing.py -v      # CLI argument parsing
+pytest tests/test_compact.py -v      # Compact CSV output mode
 pytest tests/test_utilities.py -v    # Timer, helpers, validation
 pytest tests/test_telemetry.py -v    # Telemetry classes
 pytest tests/test_smoke.py -v        # Benchmark smoke tests (CPU)
@@ -895,6 +968,7 @@ pytest tests/ --cov=. --cov-report=term-missing
 | Test File | Coverage | Description |
 |-----------|----------|-------------|
 | `test_parsing.py` | CLI & config | Argument parsing, CPU-GPU mapping, validation |
+| `test_compact.py` | Compact mode | CSV output, columns, header control, logging suppression |
 | `test_utilities.py` | Core helpers | Timer, VerbosePrinter, GFLOP calculations |
 | `test_telemetry.py` | Telemetry | Class structure, thread behavior, factory |
 | `test_smoke.py` | Benchmarks | Run each benchmark on CPU with minimal iterations |
