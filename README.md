@@ -1,8 +1,8 @@
 # Torch Hammer  
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE.md)
-[![Tests](https://img.shields.io/badge/tests-102%20passed-brightgreen.svg)](tests/)
-[![Coverage](https://img.shields.io/badge/coverage-39%25-yellow.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-134%20passed-brightgreen.svg)](tests/)
+[![Coverage](https://img.shields.io/badge/coverage-49%25-yellow.svg)](tests/)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-1.10+-ee4c2c.svg)](https://pytorch.org/)
 
