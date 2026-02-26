@@ -1421,6 +1421,190 @@ def _emit_compact_csv(row: dict, verbose: bool = False,
     print(buf.getvalue().rstrip("\r\n"), file=out, flush=True)
 
 
+# ───────────────────────────────────────────────────────────────────────
+# Syslog / dmesg structured output  (--syslog, --syslog-dmesg)
+# ───────────────────────────────────────────────────────────────────────
+class SyslogReporter:
+    """Write structured key=value entries to syslog.
+
+    Reads existing result dicts produced by ``_log_summary`` — no new
+    hardware queries.  Severity is derived from the threshold flags that
+    the user already provides (``--temp-warn-C``, ``--temp-critical-C``,
+    ``--efficiency-warn-pct``).
+    """
+
+    def __init__(self, tag: str = "torch-hammer",
+                 temp_warn: float = 90.0,
+                 temp_critical: float = 95.0,
+                 efficiency_warn: float = 70.0,
+                 run_id: str | None = None) -> None:
+        import syslog as _syslog
+        self._syslog = _syslog
+        _syslog.openlog(tag, _syslog.LOG_PID, _syslog.LOG_USER)
+        self.temp_warn = temp_warn
+        self.temp_critical = temp_critical
+        self.efficiency_warn = efficiency_warn
+        if run_id is None:
+            import uuid
+            run_id = uuid.uuid4().hex[:8]
+        self.run_id = run_id
+
+    # ── formatting helpers ──────────────────────────────────────────
+
+    @staticmethod
+    def _kv(d: dict) -> str:
+        """Flatten *d* into a syslog-safe ``key=value`` string."""
+        return " ".join(
+            f"{k}={str(v).replace(' ', '_')}"
+            for k, v in d.items()
+            if v is not None and v != ""
+        )
+
+    def _priority(self, result: dict) -> int:
+        """Derive syslog priority from existing threshold fields."""
+        s = self._syslog
+        if result.get("status") == "FAIL":
+            return s.LOG_ERR
+        temp = result.get("temp_max_c")
+        if temp is not None:
+            try:
+                temp = float(temp)
+                if temp >= self.temp_critical:
+                    return s.LOG_CRIT
+                if temp >= self.temp_warn:
+                    return s.LOG_WARNING
+            except (TypeError, ValueError):
+                pass
+        if result.get("throttled") in ("true", True):
+            return s.LOG_WARNING
+        eff = result.get("efficiency_pct")
+        if eff is not None:
+            try:
+                if float(eff) < self.efficiency_warn:
+                    return s.LOG_WARNING
+            except (TypeError, ValueError):
+                pass
+        return s.LOG_INFO
+
+    # ── public API ──────────────────────────────────────────────────
+
+    def run_start(self, hostname: str, gpu_count: int) -> str:
+        from datetime import datetime, timezone
+        ts = datetime.now(timezone.utc).isoformat()
+        msg = f"RUN_START run_id={self.run_id} ts={ts} host={hostname} gpus={gpu_count}"
+        self._syslog.syslog(self._syslog.LOG_INFO, msg)
+        return msg
+
+    def bench_result(self, row: dict) -> str:
+        line = f"BENCH_RESULT {self._kv(row)}"
+        self._syslog.syslog(self._priority(row), line)
+        return line
+
+    def run_end(self, passed: int, failed: int, elapsed: float) -> str:
+        from datetime import datetime, timezone
+        ts = datetime.now(timezone.utc).isoformat()
+        msg = f"RUN_END run_id={self.run_id} ts={ts} passed={passed} failed={failed} total_elapsed={elapsed:.1f}s"
+        self._syslog.syslog(self._syslog.LOG_INFO, msg)
+        return msg
+
+    def close(self) -> None:
+        self._syslog.closelog()
+
+
+class DmesgWriter:
+    """Write to ``/dev/kmsg`` for kernel ring-buffer correlation.
+
+    Falls back gracefully when the device is not available or the process
+    lacks ``CAP_SYSLOG`` / root privileges.
+    """
+
+    def __init__(self, log: logging.Logger | None = None) -> None:
+        self._fd = None
+        try:
+            self._fd = open("/dev/kmsg", "w")          # noqa: SIM115
+        except PermissionError:
+            if log:
+                log.warning(
+                    "--syslog-dmesg: cannot write to /dev/kmsg (Permission denied). "
+                    "Requires root or CAP_SYSLOG. Continuing with syslog only. "
+                    "Hint: sudo setcap cap_syslog+ep $(which python3)")
+        except FileNotFoundError:
+            if log:
+                log.warning(
+                    "--syslog-dmesg: /dev/kmsg not found (not Linux?). "
+                    "Continuing with syslog only.")
+
+    @property
+    def available(self) -> bool:
+        return self._fd is not None
+
+    def write(self, msg: str) -> None:
+        if self._fd is not None:
+            try:
+                self._fd.write(f"torch-hammer: {msg}\n")
+                self._fd.flush()
+            except OSError:
+                pass  # Ring buffer full or fd closed — never crash
+
+    def close(self) -> None:
+        if self._fd is not None:
+            self._fd.close()
+            self._fd = None
+
+
+def _build_syslog_row(perf: dict, tel_data: dict, gpu_index: int,
+                      verbose: bool = False,
+                      run_id: str = "") -> dict:
+    """Build a syslog KV row from a ``perf_summary`` dict.
+
+    Mirrors the logic in ``_maybe_emit_compact`` so that the syslog KV
+    fields are consistent with compact-mode CSV columns.
+    """
+    import socket
+    hostname = tel_data.get('hostname') or socket.gethostname().split('.', 1)[0]
+    tel_s = perf.get('telemetry', {})
+
+    row: dict = {}
+    if run_id:
+        row['run_id'] = run_id
+    row.update({
+        'hostname':    hostname,
+        'gpu':         gpu_index,
+        'gpu_model':   tel_data.get('model', ''),
+        'serial':      tel_data.get('serial', ''),
+        'benchmark':   perf['name'],
+        'dtype':       perf.get('params', {}).get('dtype', ''),
+        'iterations':  perf.get('iterations', ''),
+        'runtime_s':   perf.get('runtime_s', ''),
+        'min':         f"{perf['min']:.4f}",
+        'mean':        f"{perf['mean']:.4f}",
+        'max':         f"{perf['max']:.4f}",
+        'unit':        perf['unit'],
+        'power_avg_w': f"{tel_s.get('power_W_mean', 0):.1f}" if tel_s.get('power_W_mean') else '',
+        'temp_max_c':  f"{tel_s.get('temp_gpu_C_max', 0):.0f}" if tel_s.get('temp_gpu_C_max') else '',
+        'status':      'PASS',
+    })
+
+    # Efficiency percentage (if baselines were evaluated)
+    if 'efficiency_pct' in perf:
+        row['efficiency_pct'] = f"{perf['efficiency_pct']:.1f}"
+
+    # Throttle flag
+    if perf.get('throttled'):
+        row['throttled'] = 'true'
+
+    if verbose:
+        row.update({
+            'sm_util_mean':     f"{tel_s['sm_util_mean']:.0f}" if 'sm_util_mean' in tel_s else '',
+            'mem_bw_util_mean': f"{tel_s['mem_bw_util_mean']:.0f}" if 'mem_bw_util_mean' in tel_s else '',
+            'gpu_clock_mean':   f"{tel_s['gpu_clock_mean']:.0f}" if 'gpu_clock_mean' in tel_s else '',
+            'mem_used_gb_mean': f"{tel_s['mem_used_MB_mean'] / 1024:.2f}" if 'mem_used_MB_mean' in tel_s else '',
+            'throttled':        'true' if perf.get('throttled') else 'false',
+        })
+
+    return row
+
+
 def _log_summary(name, vals, unit, logger, tel, device, params=None, baselines=None, verbose=False, skip_telemetry=10, tel_thread=None, runtime_s=None):
     s = dict(min=min(vals), mean=statistics.mean(vals), max=max(vals))
     tel_data = tel.read()
@@ -2946,7 +3130,7 @@ def apply_config_to_args(args, config):
             # Check if this looks like a default value that wasn't explicitly set
             if arg_name in ['warmup'] and current == 10:  # Default warmup
                 setattr(args, arg_name, value)
-            elif arg_name in ['verbose', 'no_log', 'stress_test', 'dry_run', 'all_gpus', 'cpu_affinity', 'verbose_file_only']:
+            elif arg_name in ['verbose', 'no_log', 'stress_test', 'dry_run', 'all_gpus', 'cpu_affinity', 'verbose_file_only', 'compact', 'syslog', 'syslog_dmesg']:
                 if not current and value:  # Only set True values if current is False
                     setattr(args, arg_name, value)
             elif arg_name in ['log_file', 'log_dir', 'temp_dir'] and not current:
@@ -3030,6 +3214,8 @@ def build_parser():
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--verbose-file-only", action="store_true", help="With --verbose and --log-file/--log-dir, suppress stdout (file only)")
     p.add_argument("--compact", action="store_true", help="Machine-readable CSV output to stdout (one row per benchmark). Suppresses normal log chatter. Combine with --verbose for extra telemetry columns.")
+    p.add_argument("--syslog", action="store_true", help="Write structured key=value benchmark results to syslog. Severity is auto-derived from --temp-warn-C, --temp-critical-C, --efficiency-warn-pct thresholds.")
+    p.add_argument("--syslog-dmesg", action="store_true", help="Also write to /dev/kmsg for kernel ring-buffer correlation (requires --syslog, requires root or CAP_SYSLOG; Linux only).")
     p.add_argument("--dry-run", action="store_true", help="Show configuration and exit without running benchmarks")
     p.add_argument("--repeats", type=int, default=1, help="Number of times to repeat the entire benchmark suite")
     p.add_argument("--repeat-delay", type=float, default=0, help="Delay in seconds between repeats (for thermal stabilization)")
@@ -3544,6 +3730,48 @@ def run_single_gpu(args, gpu_index: int, log=None):
                           header=(_compact_header_needed and _is_single))
         _compact_header_needed = False
     
+    # ── syslog helpers (closure over tel_data, args, gpu_index) ──
+    _syslog_enabled = getattr(args, 'syslog', False)
+    _syslog_reporter = None
+    _dmesg_writer = None
+    _sl_bench_passed = 0
+    _sl_bench_failed = 0
+    if _syslog_enabled:
+        # In multi-GPU mode the parent stashes a shared run_id on args;
+        # in single-GPU mode we let SyslogReporter auto-generate one.
+        _sl_run_id = getattr(args, '_syslog_run_id', None)
+        _syslog_reporter = SyslogReporter(
+            temp_warn=getattr(args, 'temp_warn_C', 90.0),
+            temp_critical=getattr(args, 'temp_critical_C', 95.0),
+            efficiency_warn=getattr(args, 'efficiency_warn_pct', 70.0),
+            run_id=_sl_run_id,
+        )
+        if getattr(args, 'syslog_dmesg', False):
+            _dmesg_writer = DmesgWriter(log=log)
+        # Emit RUN_START immediately (survives crashes)
+        import socket as _sl_sock
+        _sl_hostname = tel_data.get('hostname') or _sl_sock.gethostname().split('.', 1)[0]
+        _sl_start_msg = _syslog_reporter.run_start(_sl_hostname, 1)
+        if _dmesg_writer:
+            _dmesg_writer.write(_sl_start_msg)
+        _sl_run_start_time = time.perf_counter()
+
+    def _maybe_emit_syslog(perf):
+        """If --syslog, emit a KV entry for the just-finished benchmark."""
+        nonlocal _sl_bench_passed, _sl_bench_failed
+        if not _syslog_reporter:
+            return
+        if perf is None:
+            _sl_bench_failed += 1
+            return
+        _sl_bench_passed += 1
+        row = _build_syslog_row(perf, tel_data, gpu_index,
+                                verbose=args.verbose,
+                                run_id=_syslog_reporter.run_id)
+        line = _syslog_reporter.bench_result(row)
+        if _dmesg_writer:
+            _dmesg_writer.write(line)
+
     # Repeat loop for running benchmark suite multiple times
     for repeat_num in range(1, args.repeats + 1):
         # Update repeat number in verbose printer
@@ -3830,6 +4058,7 @@ def run_single_gpu(args, gpu_index: int, log=None):
                 
                 # Emit compact CSV row (if --compact) before restoring params
                 _maybe_emit_compact(perf)
+                _maybe_emit_syslog(perf)
                 
                 # Restore original values after each benchmark
                 for key, value in original_values.items():
@@ -3841,46 +4070,55 @@ def run_single_gpu(args, gpu_index: int, log=None):
                 tel.reset_stats()  # Per-benchmark telemetry isolation
                 perf = batched_gemm_test(args, dev, log, tel, tel_thread, prn)
                 _maybe_emit_compact(perf)
+                _maybe_emit_syslog(perf)
                 benchmark_results.append(perf) if perf else None
             if args.convolution:
                 tel.reset_stats()  # Per-benchmark telemetry isolation
                 perf = convolution_test(args, dev, log, tel, tel_thread, prn)
                 _maybe_emit_compact(perf)
+                _maybe_emit_syslog(perf)
                 benchmark_results.append(perf) if perf else None
             if args.fft:
                 tel.reset_stats()  # Per-benchmark telemetry isolation
                 perf = fft_test(args, dev, log, tel, tel_thread, prn)
                 _maybe_emit_compact(perf)
+                _maybe_emit_syslog(perf)
                 benchmark_results.append(perf) if perf else None
             if args.einsum:
                 tel.reset_stats()  # Per-benchmark telemetry isolation
                 perf = einsum_test(args, dev, log, tel, tel_thread, prn)
                 _maybe_emit_compact(perf)
+                _maybe_emit_syslog(perf)
                 benchmark_results.append(perf) if perf else None
             if args.memory_traffic:
                 tel.reset_stats()  # Per-benchmark telemetry isolation
                 perf = memory_traffic_test(args, dev, log, tel, tel_thread, prn)
                 _maybe_emit_compact(perf)
+                _maybe_emit_syslog(perf)
                 benchmark_results.append(perf) if perf else None
             if args.heat_equation:
                 tel.reset_stats()  # Per-benchmark telemetry isolation
                 perf = laplacian_heat_equation(args, dev, log, tel, tel_thread, prn)
                 _maybe_emit_compact(perf)
+                _maybe_emit_syslog(perf)
                 benchmark_results.append(perf) if perf else None
             if args.schrodinger:
                 tel.reset_stats()  # Per-benchmark telemetry isolation
                 perf = schrodinger_equation(args, dev, log, tel, tel_thread, prn)
                 _maybe_emit_compact(perf)
+                _maybe_emit_syslog(perf)
                 benchmark_results.append(perf) if perf else None
             if args.atomic_contention:
                 tel.reset_stats()  # Per-benchmark telemetry isolation
                 perf = atomic_contention_test(args, dev, log, tel, tel_thread, prn)
                 _maybe_emit_compact(perf)
+                _maybe_emit_syslog(perf)
                 benchmark_results.append(perf) if perf else None
             if args.sparse_mm:
                 tel.reset_stats()  # Per-benchmark telemetry isolation
                 perf = sparse_mm_test(args, dev, log, tel, tel_thread, prn)
                 _maybe_emit_compact(perf)
+                _maybe_emit_syslog(perf)
                 benchmark_results.append(perf) if perf else None
     
     # End of repeat loop
@@ -3920,6 +4158,15 @@ def run_single_gpu(args, gpu_index: int, log=None):
             log.info("="*80)
         tel.shutdown()
     
+    # Emit RUN_END to syslog/dmesg and tear down
+    if _syslog_reporter:
+        elapsed = time.perf_counter() - _sl_run_start_time
+        end_msg = _syslog_reporter.run_end(_sl_bench_passed, _sl_bench_failed, elapsed)
+        if _dmesg_writer:
+            _dmesg_writer.write(end_msg)
+            _dmesg_writer.close()
+        _syslog_reporter.close()
+
     # Return results for multi-GPU summary
     return {
         'gpu_index': gpu_index,
@@ -3930,6 +4177,8 @@ def run_single_gpu(args, gpu_index: int, log=None):
         'final_telemetry': tel_data,
         'telemetry_stats': tel_stats,
         'benchmarks': benchmark_results,
+        'syslog_passed': _sl_bench_passed,
+        'syslog_failed': _sl_bench_failed,
     }
 
 
@@ -3947,16 +4196,13 @@ def _run_gpu_worker(args, gpu_idx, result_file):
         result = run_single_gpu(args, gpu_idx, log=None)
         
         if result:
-            # Check if any benchmarks actually completed successfully
-            benchmarks = result.get('benchmarks', [])
-            successful_benchmarks = [b for b in benchmarks if b is not None]
+            # Always write the result dict so the parent can aggregate
+            # syslog counters and telemetry, even when all benchmarks failed.
+            with open(result_file, 'wb') as f:
+                pickle.dump(result, f)
             
-            if successful_benchmarks:
-                # Write result to pickle file for parent process
-                with open(result_file, 'wb') as f:
-                    pickle.dump(result, f)
-            else:
-                # All benchmarks failed (returned None)
+            benchmarks = result.get('benchmarks', [])
+            if not benchmarks:
                 sys.stderr.write(f"GPU {gpu_idx}: All benchmarks failed\n")
                 sys.exit(1)
         else:
@@ -3970,7 +4216,12 @@ def _run_gpu_worker(args, gpu_idx, result_file):
 
 
 def main():
-    args = build_parser().parse_args()
+    _parser = build_parser()
+    args = _parser.parse_args()
+
+    # Validate flag dependencies
+    if getattr(args, 'syslog_dmesg', False) and not getattr(args, 'syslog', False):
+        _parser.error("--syslog-dmesg requires --syslog")
     
     # Banner handling: --forge (easter egg) > --banner > nothing
     if args.forge:
@@ -4085,6 +4336,32 @@ def main():
             cols = _compact_csv_columns(args.verbose)
             print(",".join(cols), flush=True)
         
+        # In syslog mode, emit a parent-level RUN_START framing all GPUs
+        # (each worker also emits its own per-GPU RUN_START/RUN_END)
+        _mg_syslog_reporter = None
+        _mg_dmesg_writer = None
+        _mg_start_time = None
+        if getattr(args, 'syslog', False):
+            import uuid as _mg_uuid
+            _mg_run_id = _mg_uuid.uuid4().hex[:8]
+            # Stash on args so workers inherit the same run_id
+            args._syslog_run_id = _mg_run_id
+            _mg_syslog_reporter = SyslogReporter(
+                tag='torch-hammer-mgpu',
+                temp_warn=getattr(args, 'temp_warn_C', 90.0),
+                temp_critical=getattr(args, 'temp_critical_C', 95.0),
+                efficiency_warn=getattr(args, 'efficiency_warn_pct', 70.0),
+                run_id=_mg_run_id,
+            )
+            if getattr(args, 'syslog_dmesg', False):
+                _mg_dmesg_writer = DmesgWriter(log=log)
+            import socket as _mg_sock
+            _mg_hostname = _mg_sock.gethostname().split('.', 1)[0]
+            start_msg = _mg_syslog_reporter.run_start(_mg_hostname, len(gpu_indices))
+            if _mg_dmesg_writer:
+                _mg_dmesg_writer.write(start_msg)
+            _mg_start_time = time.perf_counter()
+        
         # Use temp files for result collection to avoid IPC overhead on NUMA 0
         # Temp directory configurable via --temp-dir, TORCH_HAMMER_TEMP_DIR env var, or system default
         import tempfile
@@ -4136,6 +4413,17 @@ def main():
         
         # Sort by GPU index
         results = sorted(results, key=lambda x: x['gpu_index'])
+        
+        # Emit parent-level RUN_END for multi-GPU syslog framing
+        if _mg_syslog_reporter:
+            mg_passed = sum(r.get('syslog_passed', 0) for r in results)
+            mg_failed = sum(r.get('syslog_failed', 0) for r in results)
+            mg_elapsed = time.perf_counter() - _mg_start_time
+            end_msg = _mg_syslog_reporter.run_end(mg_passed, mg_failed, mg_elapsed)
+            if _mg_dmesg_writer:
+                _mg_dmesg_writer.write(end_msg)
+                _mg_dmesg_writer.close()
+            _mg_syslog_reporter.close()
     
     # Display unified multi-GPU summary (skip in compact mode — CSV rows already emitted)
     if len(results) > 1 and not getattr(args, 'compact', False):

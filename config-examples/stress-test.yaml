@@ -15,6 +15,10 @@ global:
   # Uncomment for multi-GPU systems:
   # all_gpus: true
   # cpu_affinity: true
+  # Output modes:
+  # compact: true          # Machine-readable CSV to stdout
+  # syslog: true           # Structured key=value entries to syslog
+  # syslog_dmesg: true     # Also write to /dev/kmsg (requires syslog)
 
 benchmarks:
   # ============================================
