@@ -10,6 +10,10 @@ description: "Fast sanity check - runs in under 2 minutes"
 global:
   warmup: 5
   verbose: false
+  # Output modes:
+  # compact: true          # Machine-readable CSV to stdout
+  # syslog: true           # Structured key=value entries to syslog
+  # syslog_dmesg: true     # Also write to /dev/kmsg (requires syslog)
 
 benchmarks:
   # Matrix multiply - the core GPU stress test

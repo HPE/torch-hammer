@@ -1,8 +1,8 @@
 # Torch Hammer  
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE.md)
-[![Tests](https://img.shields.io/badge/tests-134%20passed-brightgreen.svg)](tests/)
-[![Coverage](https://img.shields.io/badge/coverage-49%25-yellow.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-211%20passed-brightgreen.svg)](tests/)
+[![Coverage](https://img.shields.io/badge/coverage-53%25-yellow.svg)](tests/)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-1.10+-ee4c2c.svg)](https://pytorch.org/)
 
@@ -39,11 +39,13 @@ When building Torch Hammer, I was inspired by my undergraduate work in quantum c
 3. [Quick Start](#quick-start)  
 4. [Command-line Reference](#command-line-reference)  
 5. [Verbose-Mode](#Verbose)  
-6. [Telemetry Back-ends](#telemetry-back-ends)  
-7. [Examples](#examples)  
-8. [Contributing](#contributing)  
-9. [Project Governance](#project-governance)
-10. [License](#license)  
+6. [Compact Mode](#compact-mode)  
+7. [Syslog Mode](#syslog-mode)  
+8. [Telemetry Back-ends](#telemetry-back-ends)  
+9. [Examples](#examples)  
+10. [Contributing](#contributing)  
+11. [Project Governance](#project-governance)
+12. [License](#license)  
 
 ---
 
@@ -66,6 +68,8 @@ When building Torch Hammer, I was inspired by my undergraduate work in quantum c
   - AMD ROCm: power, temperature, utilization, clock
   - CPU: basic vendor & model info.
 - **Verbose logging**: every iteration, every telemetry field, one comma-separated line.
+- **Compact CSV mode**: machine-readable CSV to stdout — one row per benchmark, pipe-friendly.
+- **Syslog / dmesg mode**: structured `key=value` entries to syslog with auto-derived severity; optional `/dev/kmsg` output for kernel ring-buffer correlation.
 
 ---
 ## Installation
@@ -192,6 +196,8 @@ The most important switches are summarised below (defaults in _italics_).
 | `--verbose` | One line per iteration (see examples). |
 | `--verbose-file-only` | With `--log-file` or `--log-dir`, suppress stdout (file only). |
 | `--compact` | Machine-readable CSV to stdout (one row per benchmark). See [Compact Mode](#compact-mode). |
+| `--syslog` | Emit structured `key=value` entries to syslog after each benchmark. See [Syslog Mode](#syslog-mode). |
+| `--syslog-dmesg` | Also write syslog messages to `/dev/kmsg` (requires `--syslog`). Needs root or `CAP_SYSLOG`. |
 | `--banner` | Show ASCII banner at startup. |
 | `--json-output <path>` | Write all results and telemetry to a JSON file. |
 | `--summary-csv <path>` | Write benchmark summary table to a CSV file. |
@@ -361,6 +367,10 @@ device_index: 0
 warmup: 20
 repeats: 3
 repeat_delay: 10
+# Output modes (uncomment to enable)
+# compact: true          # Machine-readable CSV to stdout
+# syslog: true           # Structured key=value entries to syslog
+# syslog_dmesg: true     # Also write to /dev/kmsg (requires syslog: true)
 
 # Benchmark suite - can specify same test multiple times with different params
 benchmarks:
@@ -644,6 +654,96 @@ summary.
 - **stderr** = warnings / errors only (log level `WARNING`).  
 - `--compact` does **not** emit per-iteration lines; only `--verbose` does.  
 - Combine `--compact --verbose` to get extra telemetry **columns** on the summary row (not extra rows).
+
+---
+
+## Syslog Mode
+
+`--syslog` emits **structured `key=value` entries to the system log** after each
+benchmark completes.  This enables integration with log aggregators such as
+**Splunk**, **Elastic**, and **journald** without scraping CSV files.
+
+### Basic Usage
+
+```bash
+# Emit to syslog (LOG_USER facility)
+./torch-hammer.py --syslog --batched-gemm --fft
+
+# Also write to dmesg ring buffer (requires root / CAP_SYSLOG)
+sudo ./torch-hammer.py --syslog --syslog-dmesg --all-gpus
+
+# Combine with compact CSV output
+./torch-hammer.py --syslog --compact --batched-gemm > results.csv
+```
+
+### Message Types
+
+| Tag | When | Example |
+|-----|------|---------|
+| `RUN_START` | Before first benchmark | `RUN_START run_id=a3f1b2c4 ts=2025-… host=node01 gpus=4` |
+| `BENCH_RESULT` | After each benchmark | `BENCH_RESULT run_id=a3f1b2c4 hostname=node01 gpu=0 benchmark=Batched_GEMM mean=42.5 unit=TFLOPS …` |
+| `RUN_END` | After last benchmark | `RUN_END run_id=a3f1b2c4 ts=2025-… passed=9 failed=0 total_elapsed=123.5s` |
+
+### Severity Derivation
+
+Syslog priority is derived from your existing threshold flags — no extra
+configuration required:
+
+| Condition | Severity |
+|-----------|----------|
+| `status=FAIL` | `LOG_ERR` |
+| `temp_max_c ≥ --temp-critical-C` | `LOG_CRIT` |
+| `temp_max_c ≥ --temp-warn-C` | `LOG_WARNING` |
+| `throttled=true` | `LOG_WARNING` |
+| `efficiency_pct < --efficiency-warn-pct` | `LOG_WARNING` |
+| Clean pass | `LOG_INFO` |
+
+### KV Fields
+
+Every message includes a `run_id` — the first 8 hex characters of a UUID4
+generated at invocation time.  Use it to correlate all messages from a single
+run (e.g. `journalctl | grep run_id=a3f1b2c4`).
+
+Each `BENCH_RESULT` entry contains the same fields as
+[Compact Mode](#compact-mode) plus `status`, `efficiency_pct` (when baselines
+are loaded), and `throttled` (when detected).  Spaces in values are replaced
+with underscores.
+
+### dmesg Integration (`--syslog-dmesg`)
+
+`--syslog-dmesg` writes the same messages to `/dev/kmsg` so they appear in
+`dmesg` alongside kernel events.  This is useful for correlating GPU issues
+with Xid/MCE errors.
+
+```bash
+# Grant capability without running as root
+sudo setcap cap_syslog+ep $(which python3)
+./torch-hammer.py --syslog --syslog-dmesg --batched-gemm
+```
+
+If `/dev/kmsg` is unavailable or the process lacks permissions, a warning is
+printed and execution continues with syslog only — **dmesg failure never
+crashes the benchmark**.
+
+### Multi-GPU
+
+In multi-GPU mode the parent generates a **single `run_id`** shared by all
+workers and the parent framing messages.  Every `RUN_START`, `BENCH_RESULT`,
+and `RUN_END` from the same invocation carries the same `run_id`:
+
+```bash
+journalctl -t torch-hammer -t torch-hammer-mgpu | grep run_id=c4d4a27d
+```
+
+The parent emits a framing `RUN_START` (with `gpus=N`) and `RUN_END` with
+aggregate pass/fail counts using the `torch-hammer-mgpu` syslog tag.
+
+### Behaviour Notes
+
+- `--syslog-dmesg` requires `--syslog` (same pattern as `--verbose-file-only` requires `--log-file`).
+- Syslog uses the `LOG_USER` facility with tag `torch-hammer` (or `torch-hammer-mgpu` for the parent frame).
+- All messages are emitted **per-benchmark** (not batched) for crash survivability.
+- `--syslog` and `--compact` can be combined — they are independent output channels.
 
 ---
 
@@ -955,6 +1055,7 @@ pytest tests/ -v
 # Run specific test categories
 pytest tests/test_parsing.py -v      # CLI argument parsing
 pytest tests/test_compact.py -v      # Compact CSV output mode
+pytest tests/test_syslog.py -v       # Syslog output mode
 pytest tests/test_utilities.py -v    # Timer, helpers, validation
 pytest tests/test_telemetry.py -v    # Telemetry classes
 pytest tests/test_smoke.py -v        # Benchmark smoke tests (CPU)
@@ -969,6 +1070,7 @@ pytest tests/ --cov=. --cov-report=term-missing
 |-----------|----------|-------------|
 | `test_parsing.py` | CLI & config | Argument parsing, CPU-GPU mapping, validation |
 | `test_compact.py` | Compact mode | CSV output, columns, header control, logging suppression |
+| `test_syslog.py` | Syslog mode | SyslogReporter, DmesgWriter, KV formatting, priority derivation, pass/fail counting, run_id |
 | `test_utilities.py` | Core helpers | Timer, VerbosePrinter, GFLOP calculations |
 | `test_telemetry.py` | Telemetry | Class structure, thread behavior, factory |
 | `test_smoke.py` | Benchmarks | Run each benchmark on CPU with minimal iterations |

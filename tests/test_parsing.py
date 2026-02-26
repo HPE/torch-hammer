@@ -361,3 +361,63 @@ class TestCpuListParsing:
         """Duplicate CPUs should be removed."""
         result = th.parse_cpu_list("0-3,2-5")
         assert result == [0, 1, 2, 3, 4, 5]  # Sorted and deduplicated
+
+
+class TestApplyConfigToArgs:
+    """Tests for apply_config_to_args YAML global settings."""
+
+    def _apply(self, th, parser, config):
+        """Helper: parse empty CLI, apply config, return args."""
+        import sys
+        orig = sys.argv
+        sys.argv = ["torch-hammer.py"]  # no CLI flags
+        try:
+            args = parser.parse_args([])
+            return th.apply_config_to_args(args, config)
+        finally:
+            sys.argv = orig
+
+    def test_syslog_from_yaml(self, th, parser):
+        """syslog: true in YAML global should set args.syslog."""
+        args = self._apply(th, parser, {"global": {"syslog": True}})
+        assert args.syslog is True
+
+    def test_syslog_dmesg_from_yaml(self, th, parser):
+        """syslog_dmesg: true in YAML global should set args.syslog_dmesg."""
+        args = self._apply(th, parser, {"global": {"syslog_dmesg": True}})
+        assert args.syslog_dmesg is True
+
+    def test_compact_from_yaml(self, th, parser):
+        """compact: true in YAML global should set args.compact."""
+        args = self._apply(th, parser, {"global": {"compact": True}})
+        assert args.compact is True
+
+    def test_all_output_modes_together(self, th, parser):
+        """All three output flags can coexist from YAML."""
+        config = {"global": {"compact": True, "syslog": True, "syslog_dmesg": True}}
+        args = self._apply(th, parser, config)
+        assert args.compact is True
+        assert args.syslog is True
+        assert args.syslog_dmesg is True
+
+    def test_cli_overrides_yaml_syslog(self, th, parser):
+        """CLI --syslog should take precedence over YAML syslog: false."""
+        import sys
+        orig = sys.argv
+        sys.argv = ["torch-hammer.py", "--syslog"]
+        try:
+            args = parser.parse_args(["--syslog"])
+            args = th.apply_config_to_args(args, {"global": {"syslog": False}})
+            assert args.syslog is True
+        finally:
+            sys.argv = orig
+
+    def test_yaml_false_does_not_override_default(self, th, parser):
+        """syslog: false in YAML should leave default False unchanged."""
+        args = self._apply(th, parser, {"global": {"syslog": False}})
+        assert args.syslog is False
+
+    def test_hyphen_key_normalised(self, th, parser):
+        """YAML key 'syslog-dmesg' (hyphenated) should map to args.syslog_dmesg."""
+        args = self._apply(th, parser, {"global": {"syslog-dmesg": True}})
+        assert args.syslog_dmesg is True
