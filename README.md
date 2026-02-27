@@ -648,7 +648,7 @@ summary.
 ./torch-hammer.py --compact --all-gpus --batched-gemm > results.csv
 ```
 
-### Behaviour Notes
+### Behavior Notes
 
 - **stdout** = pure CSV (header + data rows).  
 - **stderr** = warnings / errors only (log level `WARNING`).  
@@ -715,11 +715,6 @@ with underscores.
 `dmesg` alongside kernel events.  This is useful for correlating GPU issues
 with Xid/MCE errors.
 
-```bash
-# Grant capability without running as root
-sudo setcap cap_syslog+ep $(which python3)
-./torch-hammer.py --syslog --syslog-dmesg --batched-gemm
-```
 
 If `/dev/kmsg` is unavailable or the process lacks permissions, a warning is
 printed and execution continues with syslog only — **dmesg failure never
@@ -738,7 +733,7 @@ journalctl -t torch-hammer -t torch-hammer-mgpu | grep run_id=c4d4a27d
 The parent emits a framing `RUN_START` (with `gpus=N`) and `RUN_END` with
 aggregate pass/fail counts using the `torch-hammer-mgpu` syslog tag.
 
-### Behaviour Notes
+### Behavior Notes
 
 - `--syslog-dmesg` requires `--syslog` (same pattern as `--verbose-file-only` requires `--log-file`).
 - Syslog uses the `LOG_USER` facility with tag `torch-hammer` (or `torch-hammer-mgpu` for the parent frame).
