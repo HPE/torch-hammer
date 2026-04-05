@@ -35,17 +35,18 @@ When building Torch Hammer, I was inspired by my undergraduate work in quantum c
 
 ## Table of Contents
 1. [Key Features](#key-features)  
-2. [Installation](#installation)  
-3. [Quick Start](#quick-start)  
-4. [Command-line Reference](#command-line-reference)  
-5. [Verbose-Mode](#Verbose)  
-6. [Compact Mode](#compact-mode)  
-7. [Syslog Mode](#syslog-mode)  
-8. [Telemetry Back-ends](#telemetry-back-ends)  
-9. [Examples](#examples)  
-10. [Contributing](#contributing)  
-11. [Project Governance](#project-governance)
-12. [License](#license)  
+2. [Tested Platforms](#tested-platforms)  
+3. [Installation](#installation)  
+4. [Quick Start](#quick-start)  
+5. [Command-line Reference](#command-line-reference)  
+6. [Verbose-Mode](#Verbose)  
+7. [Compact Mode](#compact-mode)  
+8. [Syslog Mode](#syslog-mode)  
+9. [Telemetry Back-ends](#telemetry-back-ends)  
+10. [Examples](#examples)  
+11. [Contributing](#contributing)  
+12. [Project Governance](#project-governance)
+13. [License](#license)  
 
 ---
 
@@ -70,6 +71,44 @@ When building Torch Hammer, I was inspired by my undergraduate work in quantum c
 - **Verbose logging**: every iteration, every telemetry field, one comma-separated line.
 - **Compact CSV mode**: machine-readable CSV to stdout — one row per benchmark, pipe-friendly.
 - **Syslog / dmesg mode**: structured `key=value` entries to syslog with auto-derived severity; optional `/dev/kmsg` output for kernel ring-buffer correlation.
+
+---
+
+## Tested Platforms
+
+Torch Hammer has been validated on **50+ hardware configurations** spanning NVIDIA, AMD, Arm, and Apple platforms.
+
+### HPC / Data Center Accelerators
+
+| Vendor | Accelerator |
+|--------|-------------|
+| AMD | Instinct MI300A, Instinct MI250X |
+| NVIDIA | B200, GH200, H100, A100 |
+
+### NVIDIA GPUs
+
+| Family | GPUs |
+|--------|------|
+| **GeForce (Turing)** | GTX 1660 SUPER, RTX 2060 SUPER, RTX 2080 Ti, RTX 2080 SUPER |
+| **GeForce (Ampere)** | RTX 3060 Ti, RTX 3060 Mobile, RTX 3070, RTX 3070 Ti, RTX 3080, RTX 3080 Ti, RTX 3090 |
+| **GeForce (Ada Lovelace)** | RTX 4060 Ti, RTX 4070 Ti SUPER, RTX 4080, RTX 4080 SUPER, RTX 4090, RTX 4090 D |
+| **GeForce (Blackwell)** | RTX 5060 Ti, RTX 5070, RTX 5070 Ti, RTX 5080, RTX 5090 |
+| **Professional** | Quadro RTX 6000, Titan RTX, RTX A4000, RTX A5000, RTX A6000, RTX 6000 Ada, RTX PRO 4000, RTX PRO 5000, RTX PRO 6000 Server, RTX PRO 6000 Workstation |
+| **Data Center** | A10, A40, A100 PCIe, A100 SXM, A800, L4, L40S, H100 NVL, H100 SXM, H200, B200 |
+
+### CPUs
+
+| Vendor | Processor |
+|--------|----------|
+| AMD | EPYC Rome, EPYC Milan, EPYC Trento |
+| Arm | Cortex-A76 |
+| NVIDIA | Grace |
+
+### Apple Silicon
+
+| Chip |
+|------|
+| M3 Pro |
 
 ---
 ## Installation
