@@ -45,6 +45,9 @@ htmlcov/
 *.log
 *.json.results
 
+# AI / Copilot
+.github/copilot-instructions.md
+torch-hammer.code-workspace
 # OS
 .DS_Store
 Thumbs.db

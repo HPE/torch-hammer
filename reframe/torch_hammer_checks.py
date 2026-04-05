@@ -333,7 +333,7 @@ class TorchHammerSchrodinger(TorchHammerBase):
         """Add Schrödinger-specific options."""
         self.executable_opts.extend([
             '--schrodinger',
-            f'--schrodinger-precision={self.precision}',
+            f'--precision-schrodinger={self.precision}',
             f'--schrodinger-grid-size={self.grid_size}',
             f'--schrodinger-time-steps={self.time_steps}',
             f'--schrodinger-potential={self.potential}',
@@ -361,7 +361,7 @@ class TorchHammerAtomic(TorchHammerBase):
     descr = 'Torch Hammer Atomic Contention Benchmark'
     tags = {'gpu', 'memory', 'atomic', 'contention'}
     
-    precision = parameter(['float32', 'int32'])
+    precision = parameter(['float32', 'float64'])
     target_size = variable(int, value=1_000_000)
     num_updates = variable(int, value=10_000_000)
     contention_range = variable(int, value=1024)
@@ -530,8 +530,9 @@ class TorchHammerMultiGPU(TorchHammerBase):
     def validate_multi_gpu(self):
         """Validate all GPUs completed."""
         # Check that we see output from all GPUs
+        # device_label() outputs "GPU0", "GPU1" etc. (no space)
         checks = [
-            sn.assert_found(rf'\[GPU {i}\]', self.stdout) 
+            sn.assert_found(rf'\[GPU{i}\b', self.stdout) 
             for i in range(self.num_gpus)
         ]
         return sn.all(checks)

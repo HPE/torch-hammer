@@ -285,39 +285,91 @@ class TestBenchmarkExecution:
         assert result is not None
         assert result["min"] > 0
 
+    def test_atomic_contention_runs(self, th, base_args, cpu_device, mock_telemetry, mock_telemetry_thread, mock_logger, mock_printer):
+        """Atomic contention benchmark should run without errors on CPU."""
+        base_args.atomic_contention = True
+        base_args.atomic_target_size = 1000
+        base_args.atomic_num_updates = 5000
+        base_args.atomic_contention_range = 64
+        base_args.precision_atomic = "float32"
+        base_args.inner_loop_atomic = 2
+
+        mock_telemetry.reset_stats()
+
+        result = th.atomic_contention_test(
+            base_args, cpu_device, mock_logger,
+            mock_telemetry, mock_telemetry_thread, mock_printer
+        )
+
+        assert result is not None
+        assert result["name"] == "Atomic Contention"
+        assert result["min"] > 0
+        assert result["mean"] > 0
+        assert result["min"] <= result["mean"] <= result["max"]
+
+    def test_sparse_mm_runs(self, th, base_args, cpu_device, mock_telemetry, mock_telemetry_thread, mock_logger, mock_printer):
+        """Sparse MM benchmark should run without errors on CPU."""
+        base_args.sparse_mm = True
+        base_args.sparse_m = 64
+        base_args.sparse_n = 64
+        base_args.sparse_k = 64
+        base_args.sparse_density = 0.10
+        base_args.precision_sparse = "float32"
+        base_args.inner_loop_sparse = 2
+
+        mock_telemetry.reset_stats()
+
+        result = th.sparse_mm_test(
+            base_args, cpu_device, mock_logger,
+            mock_telemetry, mock_telemetry_thread, mock_printer
+        )
+
+        assert result is not None
+        assert result["name"] == "Sparse MM"
+        assert result["min"] > 0
+        assert result["mean"] > 0
+        assert result["min"] <= result["mean"] <= result["max"]
+
 
 class TestPrecisionVariants:
-    """Test benchmarks with different precision types."""
-    
+    """Test benchmarks with different precision types.
+
+    Mirrors the precision coverage in reframe/ci_functional_checks.py:
+    - Standard benchmarks (GEMM, Conv, FFT, Einsum, Memory, Heat, Schrödinger)
+      accept all 6 precisions (bfloat16, float16, float32, float64, complex64,
+      complex128).
+    - Atomic and Sparse accept only 4 real precisions (float16, bfloat16,
+      float32, float64).
+    """
+
     @pytest.fixture
     def cpu_device(self):
         return torch.device("cpu")
-    
+
     @pytest.fixture
     def mock_telemetry(self, th):
         return th.CpuTelemetry(0)
-    
+
     @pytest.fixture
     def mock_telemetry_thread(self, th, mock_telemetry, cpu_device):
         thread = th.TelemetryThread(mock_telemetry, cpu_device, sample_interval_ms=50)
         thread.latest_reading = mock_telemetry.read()
         thread.get_iteration_telemetry = lambda i: mock_telemetry.read()
         return thread
-    
+
     @pytest.fixture
     def mock_logger(self):
         logger = logging.getLogger("test_precision")
         logger.setLevel(logging.WARNING)
         return logger
-    
+
     @pytest.fixture
     def mock_printer(self, th, mock_logger):
         return th.VerbosePrinter(mock_logger, ["vendor", "model", "device_id"], 0)
-    
+
     @pytest.fixture
     def base_args(self, parser):
         args = parser.parse_args(["--warmup", "1"])
-        args.inner_loop_batched_gemm = 2
         args.verbose = False
         args.max_iterations = None
         args.duration = None
@@ -327,46 +379,179 @@ class TestPrecisionVariants:
         args.power_warn_pct = 98.0
         args._hardware_baselines = None
         return args
-    
-    @pytest.mark.parametrize("precision", ["float32", "float64"])
+
+    # ── GEMM: float32, float64, complex64 ────────────────────────────
+    @pytest.mark.parametrize("precision", ["float32", "float64", "complex64"])
     def test_gemm_precisions(self, th, base_args, cpu_device, mock_telemetry, mock_telemetry_thread, mock_logger, mock_printer, precision):
-        """GEMM should work with different precisions."""
-        base_args.batched_gemm = True
+        """GEMM should work with real and complex precisions."""
         base_args.batch_count_gemm = 2
         base_args.m = 32
         base_args.n = 32
         base_args.k = 32
         base_args.precision_gemm = precision
         base_args.batched_gemm_TF32_mode = False
-        
+        base_args.inner_loop_batched_gemm = 2
+
         mock_telemetry.reset_stats()
-        
         result = th.batched_gemm_test(
             base_args, cpu_device, mock_logger,
             mock_telemetry, mock_telemetry_thread, mock_printer
         )
-        
         assert result is not None
         assert result["min"] > 0
-    
-    @pytest.mark.parametrize("precision", ["float32", "complex64"])
+
+    # ── Convolution: float32, float64 ────────────────────────────────
+    @pytest.mark.parametrize("precision", ["float32", "float64"])
+    def test_convolution_precisions(self, th, base_args, cpu_device, mock_telemetry, mock_telemetry_thread, mock_logger, mock_printer, precision):
+        """Convolution should work with different precisions."""
+        base_args.batch_count_convolution = 2
+        base_args.in_channels = 3
+        base_args.out_channels = 8
+        base_args.height = 16
+        base_args.width = 16
+        base_args.kernel_size = 3
+        base_args.precision_convolution = precision
+        base_args.inner_loop_convolution = 2
+
+        mock_telemetry.reset_stats()
+        result = th.convolution_test(
+            base_args, cpu_device, mock_logger,
+            mock_telemetry, mock_telemetry_thread, mock_printer
+        )
+        assert result is not None
+        assert result["min"] > 0
+
+    # ── FFT: float32, float64, complex64, complex128 ────────────────
+    @pytest.mark.parametrize("precision", ["float32", "float64", "complex64", "complex128"])
     def test_fft_precisions(self, th, base_args, cpu_device, mock_telemetry, mock_telemetry_thread, mock_logger, mock_printer, precision):
         """FFT should work with real and complex precisions."""
-        base_args.fft = True
         base_args.batch_count_fft = 2
         base_args.nx = 16
         base_args.ny = 16
         base_args.nz = 16
         base_args.precision_fft = precision
         base_args.inner_loop_fft = 2
-        
+
         mock_telemetry.reset_stats()
-        
         result = th.fft_test(
             base_args, cpu_device, mock_logger,
             mock_telemetry, mock_telemetry_thread, mock_printer
         )
-        
+        assert result is not None
+        assert result["min"] > 0
+
+    # ── Einsum: float32, float64, complex64 ─────────────────────────
+    @pytest.mark.parametrize("precision", ["float32", "float64", "complex64"])
+    def test_einsum_precisions(self, th, base_args, cpu_device, mock_telemetry, mock_telemetry_thread, mock_logger, mock_printer, precision):
+        """Einsum attention should work with real and complex precisions."""
+        base_args.batch_count_einsum = 2
+        base_args.heads = 2
+        base_args.seq_len = 16
+        base_args.d_model = 16
+        base_args.precision_einsum = precision
+        base_args.inner_loop_einsum = 2
+
+        mock_telemetry.reset_stats()
+        result = th.einsum_test(
+            base_args, cpu_device, mock_logger,
+            mock_telemetry, mock_telemetry_thread, mock_printer
+        )
+        assert result is not None
+        assert result["min"] > 0
+
+    # ── Memory Traffic: float32, float64 ────────────────────────────
+    @pytest.mark.parametrize("precision", ["float32", "float64"])
+    def test_memory_precisions(self, th, base_args, cpu_device, mock_telemetry, mock_telemetry_thread, mock_logger, mock_printer, precision):
+        """Memory traffic should work with different precisions."""
+        base_args.memory_size = 64
+        base_args.memory_iterations = 2
+        base_args.memory_pattern = "random"
+        base_args.precision_memory = precision
+        base_args.inner_loop_memory_traffic = 2
+
+        mock_telemetry.reset_stats()
+        result = th.memory_traffic_test(
+            base_args, cpu_device, mock_logger,
+            mock_telemetry, mock_telemetry_thread, mock_printer
+        )
+        assert result is not None
+        assert result["min"] > 0
+
+    # ── Heat Equation: float32, float64 ─────────────────────────────
+    @pytest.mark.parametrize("precision", ["float32", "float64"])
+    def test_heat_precisions(self, th, base_args, cpu_device, mock_telemetry, mock_telemetry_thread, mock_logger, mock_printer, precision):
+        """Heat equation should work with different precisions."""
+        base_args.heat_grid_size = 32
+        base_args.heat_time_steps = 5
+        base_args.alpha = 0.01
+        base_args.delta_t = 0.01
+        base_args.precision_heat = precision
+        base_args.inner_loop_heat_equation = 2
+
+        mock_telemetry.reset_stats()
+        result = th.laplacian_heat_equation(
+            base_args, cpu_device, mock_logger,
+            mock_telemetry, mock_telemetry_thread, mock_printer
+        )
+        assert result is not None
+        assert result["min"] > 0
+
+    # ── Schrödinger: float32, complex64, complex128 ─────────────────
+    @pytest.mark.parametrize("precision", ["float32", "complex64", "complex128"])
+    def test_schrodinger_precisions(self, th, base_args, cpu_device, mock_telemetry, mock_telemetry_thread, mock_logger, mock_printer, precision):
+        """Schrödinger equation should work with real and complex precisions."""
+        base_args.schrodinger_grid_size = 32
+        base_args.schrodinger_time_steps = 5
+        base_args.schrodinger_delta_x = 0.1
+        base_args.schrodinger_delta_t = 0.01
+        base_args.schrodinger_hbar = 1.0
+        base_args.schrodinger_mass = 1.0
+        base_args.schrodinger_potential = "harmonic"
+        base_args.precision_schrodinger = precision
+        base_args.inner_loop_schrodinger = 2
+
+        mock_telemetry.reset_stats()
+        result = th.schrodinger_equation(
+            base_args, cpu_device, mock_logger,
+            mock_telemetry, mock_telemetry_thread, mock_printer
+        )
+        assert result is not None
+        assert result["min"] > 0
+
+    # ── Atomic Contention: float32, float64 (real-only) ─────────────
+    @pytest.mark.parametrize("precision", ["float32", "float64"])
+    def test_atomic_precisions(self, th, base_args, cpu_device, mock_telemetry, mock_telemetry_thread, mock_logger, mock_printer, precision):
+        """Atomic contention should work with real precisions."""
+        base_args.atomic_target_size = 1000
+        base_args.atomic_num_updates = 5000
+        base_args.atomic_contention_range = 64
+        base_args.precision_atomic = precision
+        base_args.inner_loop_atomic = 2
+
+        mock_telemetry.reset_stats()
+        result = th.atomic_contention_test(
+            base_args, cpu_device, mock_logger,
+            mock_telemetry, mock_telemetry_thread, mock_printer
+        )
+        assert result is not None
+        assert result["min"] > 0
+
+    # ── Sparse MM: float32, float64 (real-only) ─────────────────────
+    @pytest.mark.parametrize("precision", ["float32", "float64"])
+    def test_sparse_precisions(self, th, base_args, cpu_device, mock_telemetry, mock_telemetry_thread, mock_logger, mock_printer, precision):
+        """Sparse MM should work with real precisions."""
+        base_args.sparse_m = 64
+        base_args.sparse_n = 64
+        base_args.sparse_k = 64
+        base_args.sparse_density = 0.10
+        base_args.precision_sparse = precision
+        base_args.inner_loop_sparse = 2
+
+        mock_telemetry.reset_stats()
+        result = th.sparse_mm_test(
+            base_args, cpu_device, mock_logger,
+            mock_telemetry, mock_telemetry_thread, mock_printer
+        )
         assert result is not None
         assert result["min"] > 0
 

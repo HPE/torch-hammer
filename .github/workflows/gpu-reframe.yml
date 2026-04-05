@@ -1,0 +1,110 @@
+# Copyright 2024-2026 Hewlett Packard Enterprise Development LP
+# SPDX-License-Identifier: Apache-2.0
+#
+# Torch Hammer – ReFrame GPU Functional Tests
+#
+# Runs the full 92-test ReFrame CI suite (ci_functional_checks.py) on a
+# self-hosted runner with at least one CUDA GPU.  Each matrix leg runs a
+# tag-filtered subset so failures are granular and easy to triage.
+#
+# Prerequisites for the self-hosted runner:
+#   • At least one CUDA GPU (NVIDIA or AMD ROCm)
+#   • Python 3.9+ with PyTorch (CUDA-enabled)
+#   • Labels: [self-hosted, gpu]
+#
+# Trigger:
+#   • Every push / PR to main or develop
+#   • Manual dispatch (workflow_dispatch)
+#
+# See reframe/README.md for local usage and reframe/ci_functional_checks.py
+# for the 92-test breakdown.
+
+name: GPU Functional Tests (ReFrame)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_filter:
+        description: 'ReFrame tag to run (leave empty for all)'
+        required: false
+        default: ''
+        type: string
+
+# Cancel in-flight runs for the same branch / PR
+concurrency:
+  group: gpu-reframe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────
+  #  Matrix: one leg per benchmark tag + output/control checks
+  # ────────────────────────────────────────────────────────────────────
+  reframe:
+    name: "ReFrame · ${{ matrix.tag }}"
+    runs-on: [self-hosted, gpu]
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        tag:
+          - gemm              #  7 tests (6 precisions + TF32)
+          - conv              #  6 tests
+          - fft               #  6 tests
+          - einsum            #  6 tests
+          - memory            # 18 tests (6 precisions × 3 patterns)
+          - heat              #  6 tests
+          - schrodinger       # 12 tests (6 precisions × 2 potentials)
+          - atomic            #  4 tests
+          - sparse            #  2 tests
+          - precision-matrix  # 16 tests (matrix combos)
+          - full              #  1 test  (all 9 benchmarks)
+          - output            #  3 tests (compact, compact+verbose, JSON)
+          - control           #  5 tests (dry-run, repeats, config, stress, shuffle)
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install reframe-hpc pyyaml
+
+      - name: Verify GPU availability
+        run: |
+          python3 -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); print(f'GPU count: {torch.cuda.device_count()}'); print(f'GPU 0: {torch.cuda.get_device_name(0)}')"
+
+      - name: Run ReFrame CI checks (${{ matrix.tag }})
+        run: |
+          reframe \
+            -C reframe/settings.py \
+            -c reframe/ci_functional_checks.py \
+            -r \
+            -t ci -t ${{ matrix.tag }} \
+            --performance-report
+
+      - name: Upload ReFrame logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reframe-logs-${{ matrix.tag }}
+          path: |
+            .reframe/
+            perflogs/
+          retention-days: 14
+
+  # ────────────────────────────────────────────────────────────────────
+  #  Gate – fails the PR if any matrix leg failed
+  # ────────────────────────────────────────────────────────────────────
+  gate:
+    name: "ReFrame Gate"
+    runs-on: [self-hosted, gpu]
+    needs: reframe
+    if: always()
+    steps:
+      - name: Check matrix results
+        run: |
+          if [[ "${{ needs.reframe.result }}" != "success" ]]; then
+            echo "❌ One or more ReFrame test legs failed."
+            exit 1
+          fi
+          echo "✅ All 92 ReFrame GPU functional tests passed."

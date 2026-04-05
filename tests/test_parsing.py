@@ -41,6 +41,8 @@ class TestArgumentParser:
         assert default_args.precision_memory == "float32"
         assert default_args.precision_heat == "float32"
         assert default_args.precision_schrodinger == "float32"
+        assert default_args.precision_atomic == "float32"
+        assert default_args.precision_sparse == "float32"
     
     def test_gemm_args(self, parser):
         """GEMM-specific arguments should parse correctly."""
@@ -246,6 +248,38 @@ class TestArgumentParser:
         with pytest.raises(SystemExit):
             parser.parse_args(["--schrodinger-potential", "invalid"])
     
+    def test_atomic_contention_args(self, parser):
+        """Atomic contention arguments should parse correctly."""
+        args = parser.parse_args([
+            "--atomic-contention",
+            "--atomic-target-size", "500000",
+            "--atomic-num-updates", "5000000",
+            "--atomic-contention-range", "512",
+            "--precision-atomic", "float64",
+        ])
+        assert args.atomic_contention is True
+        assert args.atomic_target_size == 500000
+        assert args.atomic_num_updates == 5000000
+        assert args.atomic_contention_range == 512
+        assert args.precision_atomic == "float64"
+
+    def test_sparse_mm_args(self, parser):
+        """Sparse MM arguments should parse correctly."""
+        args = parser.parse_args([
+            "--sparse-mm",
+            "--sparse-m", "4096",
+            "--sparse-n", "4096",
+            "--sparse-k", "4096",
+            "--sparse-density", "0.05",
+            "--precision-sparse", "float16",
+        ])
+        assert args.sparse_mm is True
+        assert args.sparse_m == 4096
+        assert args.sparse_n == 4096
+        assert args.sparse_k == 4096
+        assert args.sparse_density == 0.05
+        assert args.precision_sparse == "float16"
+
     def test_multiple_benchmarks(self, parser):
         """Multiple benchmarks can be enabled simultaneously."""
         args = parser.parse_args([
@@ -305,14 +339,60 @@ class TestCpuGpuMapParsing:
 
 class TestConfigValidation:
     """Tests for configuration validation."""
-    
-    def test_precision_choices(self, parser):
-        """All valid precision choices should be accepted."""
-        valid_precisions = ["bfloat16", "float16", "float32", "float64", "complex64", "complex128"]
-        for precision in valid_precisions:
-            args = parser.parse_args(["--precision-gemm", precision])
-            assert args.precision_gemm == precision
-    
+
+    # ── Standard benchmarks accept all 6 precisions ───────────────
+    STANDARD_PRECISION_FLAGS = [
+        "--precision-gemm",
+        "--precision-convolution",
+        "--precision-fft",
+        "--precision-einsum",
+        "--precision-memory",
+        "--precision-heat",
+        "--precision-schrodinger",
+    ]
+    STANDARD_PRECISION_ATTR = [
+        "precision_gemm",
+        "precision_convolution",
+        "precision_fft",
+        "precision_einsum",
+        "precision_memory",
+        "precision_heat",
+        "precision_schrodinger",
+    ]
+    PRECISION_ALL = ["bfloat16", "float16", "float32", "float64", "complex64", "complex128"]
+    PRECISION_REAL = ["float16", "bfloat16", "float32", "float64"]
+
+    @pytest.mark.parametrize("flag,attr", list(zip(STANDARD_PRECISION_FLAGS, STANDARD_PRECISION_ATTR)))
+    @pytest.mark.parametrize("precision", PRECISION_ALL)
+    def test_standard_precision_choices(self, parser, flag, attr, precision):
+        """All 7 standard benchmark precision flags accept all 6 precisions."""
+        args = parser.parse_args([flag, precision])
+        assert getattr(args, attr) == precision
+
+    @pytest.mark.parametrize("precision", PRECISION_REAL)
+    def test_atomic_precision_choices(self, parser, precision):
+        """Atomic precision flag accepts all 4 real precisions."""
+        args = parser.parse_args(["--precision-atomic", precision])
+        assert args.precision_atomic == precision
+
+    @pytest.mark.parametrize("precision", PRECISION_REAL)
+    def test_sparse_precision_choices(self, parser, precision):
+        """Sparse precision flag accepts all 4 real precisions."""
+        args = parser.parse_args(["--precision-sparse", precision])
+        assert args.precision_sparse == precision
+
+    @pytest.mark.parametrize("complex_dtype", ["complex64", "complex128"])
+    def test_atomic_rejects_complex(self, parser, complex_dtype):
+        """Atomic precision flag must reject complex types."""
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--precision-atomic", complex_dtype])
+
+    @pytest.mark.parametrize("complex_dtype", ["complex64", "complex128"])
+    def test_sparse_rejects_complex(self, parser, complex_dtype):
+        """Sparse precision flag must reject complex types."""
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--precision-sparse", complex_dtype])
+
     def test_memory_pattern_choices(self, parser):
         """All valid memory patterns should be accepted."""
         valid_patterns = ["random", "streaming", "unit"]
