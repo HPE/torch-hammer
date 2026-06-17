@@ -1,0 +1,12 @@
+# Third-Party pytorch container-image please use carefully and adapt if necessary
+FROM docker.io/rocm/pytorch:rocm7.1.1_ubuntu22.04_py3.11_pytorch_release_2.10.0
+
+RUN git clone https://github.com/HPE/torch-hammer.git --branch 0.9.0
+
+WORKDIR torch-hammer
+
+RUN chmod +x torch-hammer.py \
+    && pip install -r requirements.txt \
+    && pip install amdsmi
+
+ENTRYPOINT ["/torch-hammer/torch-hammer.py"]
