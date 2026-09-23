@@ -29,6 +29,7 @@ import statistics
 import subprocess
 import sys
 import time
+import warnings
 
 try:
     import yaml
@@ -114,6 +115,21 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 import multiprocessing
 import threading
+
+# ───────────────────────────────────────────────────────────────────────
+# PRE-TORCH WARNING FILTER  ─────────────────────────────────────────────
+# PyTorch probes for NumPy at import time and emits a UserWarning when it
+# is absent ("Failed to initialize NumPy: No module named 'numpy'").
+# Torch Hammer never uses NumPy, so the message is noise — silence just
+# that one case. A NumPy that is present but broken produces a different
+# message and is intentionally left visible. Must run BEFORE `import torch`.
+# (GitHub issue #41)
+warnings.filterwarnings(
+    "ignore",
+    message=r"Failed to initialize NumPy: No module named 'numpy'",
+    category=UserWarning,
+)
+
 import torch
 
 # ───────────────────────────────────────────────────────────────────────
