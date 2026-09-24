@@ -84,7 +84,7 @@ Torch Hammer has been validated on **50+ hardware configurations** spanning NVID
 | Vendor | Accelerator |
 |--------|-------------|
 | AMD | Instinct MI300A, Instinct MI250X |
-| NVIDIA | GB300, B200, GH200, H100, A100 |
+| NVIDIA | GB300, B300, B200, GH200, H100, A100 |
 
 ### NVIDIA GPUs
 
@@ -95,7 +95,7 @@ Torch Hammer has been validated on **50+ hardware configurations** spanning NVID
 | **GeForce (Ada Lovelace)** | RTX 4060 Ti, RTX 4070 Ti SUPER, RTX 4080, RTX 4080 SUPER, RTX 4090, RTX 4090 D |
 | **GeForce (Blackwell)** | RTX 5060 Ti, RTX 5070, RTX 5070 Ti, RTX 5080, RTX 5090 |
 | **Professional** | Quadro RTX 6000, Titan RTX, RTX A4000, RTX A5000, RTX A6000, RTX 6000 Ada, RTX PRO 4000, RTX PRO 5000, RTX PRO 6000 Server, RTX PRO 6000 Workstation |
-| **Data Center** | A10, A40, A100 PCIe, A100 SXM, A800, L4, L40S, H100 NVL, H100 SXM, H200, B200 |
+| **Data Center** | A10, A40, A100 PCIe, A100 SXM, A800, L4, L40S, H100 NVL, H100 SXM, H200, B200, B300 |
 
 ### CPUs
 
