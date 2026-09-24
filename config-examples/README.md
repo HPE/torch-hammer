@@ -60,19 +60,32 @@ global:
   warmup: 10              # Warmup iterations
   verbose: true           # Enable verbose output
   all_gpus: true          # Run on all GPUs
-  cpu_affinity: true      # NUMA-aware CPU binding
+  cpu_affinity: false     # Boolean flags accept true or false
+  stress_test: true       # Auto-size benchmarks to fill available memory
+  duration: 60            # Run each benchmark for 60s (also accepted under runtime:)
 
 runtime:
-  duration: 60            # Run each benchmark for 60s
   temp_warn_C: 85.0       # Temperature warning threshold
   temp_critical_C: 92.0   # Temperature critical threshold
 ```
+
+Any `store_true`/`store_false` CLI flag can be set under `global:` with `true` or `false`,
+so `cpu_affinity: false` disables the default-on NUMA binding. Negated CLI spellings are
+accepted too: `no_cpu_affinity: true` is the same as `cpu_affinity: false`. CLI flags always
+win over the config file, in either spelling (`--no-cpu-affinity` beats `cpu_affinity: true`).
+
+`duration`, `min_iterations` and `max_iterations` may live under either `global:` or `runtime:`.
+
+When `stress_test` is on (from `global:` or `--stress-test`), stress sizing overrides the
+explicit per-benchmark sizes (m/n/k, grid sizes, batch counts, ...) for every benchmark in the
+`benchmarks:` list, exactly as it does for CLI-selected benchmarks. Precision, time steps,
+patterns and inner-loop counts are left as written.
 
 ## Creating Custom Configurations
 
 1. Copy an existing config as a starting point
 2. Adjust parameters for your use case
-3. Use `--stress-test` flag to auto-scale sizes based on GPU memory
+3. Use `--stress-test` (or `stress_test: true` under `global:`) to auto-scale sizes based on GPU memory
 
 ## Available Benchmarks
 

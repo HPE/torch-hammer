@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import logging
 import os
@@ -2320,6 +2321,32 @@ def calculate_stress_params(benchmark: str, precision: str, available_mb: float,
     return params
 
 
+_STRESS_PRECISION_ATTRS = {
+    "gemm": "precision_gemm",
+    "convolution": "precision_convolution",
+    "fft": "precision_fft",
+    "einsum": "precision_einsum",
+    "memory": "precision_memory",
+    "heat": "precision_heat",
+    "schrodinger": "precision_schrodinger",
+    "atomic": "precision_atomic",
+    "sparse": "precision_sparse",
+}
+
+
+def apply_stress_params(args, bench_key, available_mb, log):
+    """Size one benchmark to fill available memory and write the sizes onto args.
+
+    ``bench_key`` is a calculate_stress_params key (gemm, convolution, fft, einsum,
+    memory, heat, schrodinger, atomic, sparse). Every key calculate_stress_params
+    returns is the matching args attribute name, so the result is applied as-is.
+    """
+    precision = getattr(args, _STRESS_PRECISION_ATTRS[bench_key])
+    params = calculate_stress_params(bench_key, precision, available_mb, log, args)
+    for attr_name, value in params.items():
+        setattr(args, attr_name, value)
+
+
 # ───────────────────────────────────────────────────────────────────────
 # 4c. ITERATION CONTROL HELPERS ────────────────────────────────────────
 def should_continue_iterations(args, iteration: int, vals: List[float], start_time: float) -> bool:
@@ -3151,6 +3178,93 @@ def _config_get(bench_config, *keys, default=None):
     return default
 
 
+@functools.lru_cache(maxsize=None)
+def _reference_parser():
+    """A parser built once, used only to introspect flag definitions and defaults."""
+    return build_parser()
+
+
+def _parser_default(arg_name):
+    return _reference_parser().get_default(arg_name)
+
+
+def _yaml_name(option_string):
+    """'--no-cpu-affinity' -> 'no_cpu_affinity' (the spelling used as a YAML key)."""
+    return option_string.lstrip('-').replace('-', '_')
+
+
+@functools.lru_cache(maxsize=None)
+def _boolean_arg_info():
+    """Map YAML key spellings to argparse destinations for every store_true/store_false flag.
+
+    Returns ``(positive_names, negated_names)``. A store_true option such as
+    ``--cpu-affinity`` yields ``positive_names['cpu_affinity'] == 'cpu_affinity'``;
+    a store_false option such as ``--no-cpu-affinity`` (dest ``cpu_affinity``) yields
+    ``negated_names['no_cpu_affinity'] == 'cpu_affinity'``. Derived from the parser so
+    the set of recognised flags can never drift from the CLI definitions.
+    """
+    positive_names = {}
+    negated_names = {}
+    for action in _reference_parser()._actions:
+        if isinstance(action, argparse._StoreTrueAction):
+            names = positive_names
+        elif isinstance(action, argparse._StoreFalseAction):
+            names = negated_names
+        else:
+            continue
+        for option_string in action.option_strings:
+            names[_yaml_name(option_string)] = action.dest
+    return positive_names, negated_names
+
+
+def _is_boolean_setting(arg_name):
+    positive_names, negated_names = _boolean_arg_info()
+    return arg_name in positive_names or arg_name in negated_names
+
+
+def _cli_set(dest, cli_args_set):
+    """True if the CLI set *dest* under any spelling, positive (--x) or negated (--no-x)."""
+    positive_names, negated_names = _boolean_arg_info()
+    spellings = dict(positive_names, **negated_names)
+    return any(name in cli_args_set for name, mapped_dest in spellings.items() if mapped_dest == dest)
+
+
+def _apply_boolean_setting(args, arg_name, value, cli_args_set):
+    """Apply a YAML boolean flag: the explicit value wins unless the CLI set that flag.
+
+    A negated spelling (``no_cpu_affinity: true``) inverts the value and lands on the
+    positive destination (``args.cpu_affinity = False``).
+    """
+    positive_names, negated_names = _boolean_arg_info()
+    if arg_name in negated_names:
+        dest, effective_value = negated_names[arg_name], not bool(value)
+    else:
+        dest, effective_value = positive_names[arg_name], bool(value)
+    if not _cli_set(dest, cli_args_set):
+        setattr(args, dest, effective_value)
+
+
+_RUNTIME_SETTING_NAMES = ('duration', 'min_iterations', 'max_iterations',
+                          'temp_warn_C', 'temp_critical_C', 'power_warn_pct',
+                          'outlier_threshold_pct', 'efficiency_warn_pct')
+_GLOBAL_RUNTIME_SETTING_NAMES = ('duration', 'min_iterations', 'max_iterations')
+
+
+def _apply_runtime_setting(args, arg_name, value, cli_args_set):
+    """Apply one runtime setting (duration, iteration bounds, thresholds) from YAML.
+
+    The YAML value is used only when the CLI did not set the flag and the current
+    value is still unset or still the parser default.
+    """
+    if not hasattr(args, arg_name) or arg_name in cli_args_set:
+        return
+    current = getattr(args, arg_name)
+    if current is None:
+        setattr(args, arg_name, value)
+    elif arg_name in _RUNTIME_SETTING_NAMES and current == _parser_default(arg_name):
+        setattr(args, arg_name, value)
+
+
 def apply_config_to_args(args, config):
     """Apply configuration file settings to args namespace. CLI args take precedence."""
     if not config:
@@ -3173,39 +3287,25 @@ def apply_config_to_args(args, config):
         # Special case: if --verbose-file-only is set on CLI, don't apply verbose from YAML
         if arg_name == 'verbose' and 'verbose_file_only' in cli_args_set:
             continue
+        if _is_boolean_setting(arg_name):
+            _apply_boolean_setting(args, arg_name, value, cli_args_set)
+            continue
+        if arg_name in _GLOBAL_RUNTIME_SETTING_NAMES:
+            _apply_runtime_setting(args, arg_name, value, cli_args_set)
+            continue
         # Only apply if CLI didn't set it (i.e., still at default)
         if hasattr(args, arg_name):
             current = getattr(args, arg_name)
             # Check if this looks like a default value that wasn't explicitly set
             if arg_name in ['warmup'] and current == 10:  # Default warmup
                 setattr(args, arg_name, value)
-            elif arg_name in ['verbose', 'no_log', 'stress_test', 'dry_run', 'all_gpus', 'cpu_affinity', 'verbose_file_only', 'compact', 'syslog', 'syslog_dmesg']:
-                if not current and value:  # Only set True values if current is False
-                    setattr(args, arg_name, value)
             elif arg_name in ['log_file', 'log_dir', 'temp_dir'] and not current:
                 setattr(args, arg_name, value)
     
     # Apply runtime settings (duration, iterations, thresholds)
     runtime_settings = config.get('runtime', {})
     for key, value in runtime_settings.items():
-        arg_name = key.replace('-', '_')
-        if hasattr(args, arg_name) and getattr(args, arg_name) is None or \
-           (hasattr(args, arg_name) and isinstance(getattr(args, arg_name), (int, float)) and 
-            arg_name in ['duration', 'min_iterations', 'max_iterations',
-                         'temp_warn_C', 'temp_critical_C', 'power_warn_pct', 
-                         'outlier_threshold_pct', 'efficiency_warn_pct']):
-            # For numeric thresholds, check if still at default before overriding
-            parser_defaults = {
-                'temp_warn_C': 90.0,
-                'temp_critical_C': 95.0,
-                'power_warn_pct': 98.0,
-                'outlier_threshold_pct': 15.0,
-                'efficiency_warn_pct': 70.0,
-                'min_iterations': 10
-            }
-            current = getattr(args, arg_name)
-            if current is None or (arg_name in parser_defaults and current == parser_defaults[arg_name]):
-                setattr(args, arg_name, value)
+        _apply_runtime_setting(args, key.replace('-', '_'), value, cli_args_set)
     
     # Store benchmark list for multiple invocations
     benchmarks = config.get('benchmarks', [])
@@ -3628,64 +3728,30 @@ def run_single_gpu(args, gpu_index: int, log=None):
         args.max_iterations = float('inf')
         log.info(f"Duration limit: {args.duration}s (iterations unlimited)")
     
-    # Stress test mode: override parameters with memory-optimized values
+    # Stress test mode: override parameters with memory-optimized values.
+    # available_mb stays in scope for the config-file dispatch loop below.
+    available_mb = get_available_memory_mb(dev) if args.stress_test else None
     if args.stress_test:
-        available_mb = get_available_memory_mb(dev)
         log.info(f"[Stress Test] Available memory: {available_mb:.0f} MB")
         
         if args.batched_gemm:
-            params = calculate_stress_params("gemm", args.precision_gemm, available_mb, log)
-            args.m = params["m"]
-            args.n = params["n"]
-            args.k = params["k"]
-            args.batch_count_gemm = params["batch_count_gemm"]
-        
+            apply_stress_params(args, "gemm", available_mb, log)
         if args.convolution:
-            params = calculate_stress_params("convolution", args.precision_convolution, available_mb, log)
-            args.batch_count_convolution = params["batch_count_convolution"]
-            args.in_channels = params["in_channels"]
-            args.out_channels = params["out_channels"]
-            args.height = params["height"]
-            args.width = params["width"]
-            args.kernel_size = params["kernel_size"]
-        
+            apply_stress_params(args, "convolution", available_mb, log)
         if args.fft:
-            params = calculate_stress_params("fft", args.precision_fft, available_mb, log)
-            args.batch_count_fft = params["batch_count_fft"]
-            args.nx = params["nx"]
-            args.ny = params["ny"]
-            args.nz = params["nz"]
-        
+            apply_stress_params(args, "fft", available_mb, log)
         if args.einsum:
-            params = calculate_stress_params("einsum", args.precision_einsum, available_mb, log)
-            args.batch_count_einsum = params["batch_count_einsum"]
-            args.heads = params["heads"]
-            args.seq_len = params["seq_len"]
-            args.d_model = params["d_model"]
-        
+            apply_stress_params(args, "einsum", available_mb, log)
         if args.memory_traffic:
-            params = calculate_stress_params("memory", args.precision_memory, available_mb, log)
-            args.memory_size = params["memory_size"]
-        
+            apply_stress_params(args, "memory", available_mb, log)
         if args.heat_equation:
-            params = calculate_stress_params("heat", args.precision_heat, available_mb, log)
-            args.heat_grid_size = params["heat_grid_size"]
-        
+            apply_stress_params(args, "heat", available_mb, log)
         if args.schrodinger:
-            params = calculate_stress_params("schrodinger", args.precision_schrodinger, available_mb, log)
-            args.schrodinger_grid_size = params["schrodinger_grid_size"]
-        
+            apply_stress_params(args, "schrodinger", available_mb, log)
         if args.atomic_contention:
-            params = calculate_stress_params("atomic", args.precision_atomic, available_mb, log)
-            args.atomic_target_size = params["atomic_target_size"]
-            args.atomic_num_updates = params["atomic_num_updates"]
-        
+            apply_stress_params(args, "atomic", available_mb, log)
         if args.sparse_mm:
-            params = calculate_stress_params("sparse", args.precision_sparse, available_mb, log, args)
-            args.sparse_m = params["sparse_m"]
-            args.sparse_n = params["sparse_n"]
-            args.sparse_k = params["sparse_k"]
-            args.sparse_density = params["sparse_density"]
+            apply_stress_params(args, "sparse", available_mb, log)
     
     # Dry-run mode: show configuration and exit
     if args.dry_run:
@@ -3886,6 +3952,8 @@ def run_single_gpu(args, gpu_index: int, log=None):
                     args.k = _config_get(bench_config, 'k', default=args.k)
                     args.batched_gemm_TF32_mode = _config_get(bench_config, 'tf32_mode', 'batched_gemm_TF32_mode', default=False)
                     args.inner_loop_batched_gemm = _config_get(bench_config, 'inner_loop', 'inner_loop_batched_gemm', default=args.inner_loop_batched_gemm)
+                    if args.stress_test:
+                        apply_stress_params(args, "gemm", available_mb, log)
                     
                     # DEBUG: Log parameters being used
                     log.info(f"[GPU{gpu_index} GEMM CONFIG] B={args.batch_count_gemm}, M={args.m}, N={args.n}, K={args.k}, dtype={args.precision_gemm}, iters={args.inner_loop_batched_gemm}")
@@ -3920,6 +3988,8 @@ def run_single_gpu(args, gpu_index: int, log=None):
                     args.width = _config_get(bench_config, 'width', default=args.width)
                     args.kernel_size = _config_get(bench_config, 'kernel_size', default=args.kernel_size)
                     args.inner_loop_convolution = _config_get(bench_config, 'inner_loop', 'inner_loop_convolution', default=args.inner_loop_convolution)
+                    if args.stress_test:
+                        apply_stress_params(args, "convolution", available_mb, log)
                     
                     # Reset telemetry stats before benchmark for per-benchmark isolation
                     tel.reset_stats()
@@ -3947,6 +4017,8 @@ def run_single_gpu(args, gpu_index: int, log=None):
                     args.ny = _config_get(bench_config, 'ny', default=args.ny)
                     args.nz = _config_get(bench_config, 'nz', default=args.nz)
                     args.inner_loop_fft = _config_get(bench_config, 'inner_loop', 'inner_loop_fft', default=args.inner_loop_fft)
+                    if args.stress_test:
+                        apply_stress_params(args, "fft", available_mb, log)
                     
                     # Reset telemetry stats before benchmark for per-benchmark isolation
                     tel.reset_stats()
@@ -3974,6 +4046,8 @@ def run_single_gpu(args, gpu_index: int, log=None):
                     args.seq_len = _config_get(bench_config, 'seq_len', default=args.seq_len)
                     args.d_model = _config_get(bench_config, 'head_dim', 'd_model', default=args.d_model)
                     args.inner_loop_einsum = _config_get(bench_config, 'inner_loop', 'inner_loop_einsum', default=args.inner_loop_einsum)
+                    if args.stress_test:
+                        apply_stress_params(args, "einsum", available_mb, log)
                     
                     # Reset telemetry stats before benchmark for per-benchmark isolation
                     tel.reset_stats()
@@ -3999,6 +4073,8 @@ def run_single_gpu(args, gpu_index: int, log=None):
                     args.memory_iterations = _config_get(bench_config, 'iterations', 'memory_iterations', default=args.memory_iterations)
                     args.memory_pattern = _config_get(bench_config, 'pattern', 'memory_pattern', default=args.memory_pattern)
                     args.inner_loop_memory_traffic = _config_get(bench_config, 'inner_loop', 'inner_loop_memory_traffic', default=args.inner_loop_memory_traffic)
+                    if args.stress_test:
+                        apply_stress_params(args, "memory", available_mb, log)
                     
                     # Reset telemetry stats before benchmark for per-benchmark isolation
                     tel.reset_stats()
@@ -4026,6 +4102,8 @@ def run_single_gpu(args, gpu_index: int, log=None):
                     args.alpha = _config_get(bench_config, 'alpha', default=getattr(args, 'alpha', 0.01))
                     args.delta_t = _config_get(bench_config, 'delta_t', default=getattr(args, 'delta_t', 0.01))
                     args.inner_loop_heat_equation = _config_get(bench_config, 'inner_loop', 'inner_loop_heat_equation', default=getattr(args, 'inner_loop_heat_equation', 10))
+                    if args.stress_test:
+                        apply_stress_params(args, "heat", available_mb, log)
                     
                     # Reset telemetry stats before benchmark for per-benchmark isolation
                     tel.reset_stats()
@@ -4049,6 +4127,8 @@ def run_single_gpu(args, gpu_index: int, log=None):
                     args.schrodinger_grid_size = _config_get(bench_config, 'grid_size', 'schrodinger_grid_size', default=getattr(args, 'schrodinger_grid_size', 128))
                     args.schrodinger_time_steps = _config_get(bench_config, 'time_steps', 'schrodinger_time_steps', default=getattr(args, 'schrodinger_time_steps', 100))
                     args.inner_loop_schrodinger = _config_get(bench_config, 'inner_loop', 'inner_loop_schrodinger', default=getattr(args, 'inner_loop_schrodinger', 10))
+                    if args.stress_test:
+                        apply_stress_params(args, "schrodinger", available_mb, log)
                     
                     # Reset telemetry stats before benchmark for per-benchmark isolation
                     tel.reset_stats()
@@ -4074,6 +4154,8 @@ def run_single_gpu(args, gpu_index: int, log=None):
                     args.atomic_num_updates = _config_get(bench_config, 'num_updates', 'atomic_num_updates', default=getattr(args, 'atomic_num_updates', 10_000_000))
                     args.atomic_contention_range = _config_get(bench_config, 'contention_range', 'atomic_contention_range', default=getattr(args, 'atomic_contention_range', 1024))
                     args.inner_loop_atomic = _config_get(bench_config, 'inner_loop', 'inner_loop_atomic', default=getattr(args, 'inner_loop_atomic', 50))
+                    if args.stress_test:
+                        apply_stress_params(args, "atomic", available_mb, log)
                     
                     # Reset telemetry stats before benchmark for per-benchmark isolation
                     tel.reset_stats()
@@ -4101,6 +4183,8 @@ def run_single_gpu(args, gpu_index: int, log=None):
                     args.sparse_k = _config_get(bench_config, 'k', 'sparse_k', default=getattr(args, 'sparse_k', 8192))
                     args.sparse_density = _config_get(bench_config, 'density', 'sparse_density', default=getattr(args, 'sparse_density', 0.01))
                     args.inner_loop_sparse = _config_get(bench_config, 'inner_loop', 'inner_loop_sparse', default=getattr(args, 'inner_loop_sparse', 50))
+                    if args.stress_test:
+                        apply_stress_params(args, "sparse", available_mb, log)
                     
                     # Reset telemetry stats before benchmark for per-benchmark isolation
                     tel.reset_stats()
