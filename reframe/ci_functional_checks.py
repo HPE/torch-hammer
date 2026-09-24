@@ -413,11 +413,23 @@ class CI_Schrodinger(TorchHammerCIBase):
 
     @sanity_function
     def validate_run(self):
+        """Schrödinger must either produce a Performance line or skip
+        gracefully when the promoted complex dtype has no kernels on this
+        backend (e.g. bfloat16 -> BComplex32 on torch 2.14 CUDA).  A Python
+        traceback is never acceptable.
+
+        The two acceptable outcomes are expressed as one regex alternation
+        rather than ``sn.any([assert_found(...), assert_found(...)])``:
+        ``assert_found`` raises SanityError on a miss instead of returning
+        False, so ``sn.any`` over it never reaches the second alternative."""
         return sn.all([
+            sn.assert_found(r'Schr.dinger Equation', self.stdout),
             sn.assert_found(
-                r'\[GPU\d+\s+Schr.dinger Equation\]\s+Performance:',
+                r'\[GPU\d+\s+Schr.dinger Equation\]\s+Performance:'
+                r'|Schr.dinger Equation\].*not supported.*skipping',
                 self.stdout,
             ),
+            sn.assert_not_found(r'Traceback', self.stdout),
             sn.assert_found(r'\[OK\] Benchmark run finished', self.stdout),
         ])
 
@@ -597,8 +609,9 @@ class CI_PrecisionMatrixStandard(TorchHammerCIBase):
     @sanity_function
     def validate_run(self):
         """Each benchmark must either produce a Performance line or a
-        graceful skip/failure message.  Some dtypes (e.g. bfloat16)
-        are not supported by every benchmark on every backend."""
+        graceful skip message.  Some dtypes (e.g. bfloat16) are not
+        supported by every benchmark on every backend: a graceful skip
+        is acceptable, a Python traceback is not."""
         return sn.all([
             sn.assert_found(r'Batched GEMM', self.stdout),
             sn.assert_found(r'Convolution', self.stdout),
@@ -609,6 +622,7 @@ class CI_PrecisionMatrixStandard(TorchHammerCIBase):
             sn.assert_found(r'Heat Equation', self.stdout),
             sn.assert_found(r'Schr.dinger Equation', self.stdout),
             sn.assert_found(r'\[OK\] Benchmark run finished', self.stdout),
+            sn.assert_not_found(r'Traceback', self.stdout),
         ])
 
 
@@ -695,7 +709,8 @@ class CI_PrecisionMatrixAll(TorchHammerCIBase):
         """All nine benchmarks must be attempted.  Some may skip
         gracefully (e.g. sparse bfloat16 on ROCm), so we check that
         each name appears in stdout — either in a Performance line
-        or in a skip/error message."""
+        or in a skip message.  A graceful skip is acceptable, a Python
+        traceback is not."""
         return sn.all([
             sn.assert_found(r'Batched GEMM', self.stdout),
             sn.assert_found(r'Convolution', self.stdout),
@@ -707,6 +722,7 @@ class CI_PrecisionMatrixAll(TorchHammerCIBase):
             sn.assert_found(r'Atomic Contention', self.stdout),
             sn.assert_found(r'Sparse MM', self.stdout),
             sn.assert_found(r'\[OK\] Benchmark run finished', self.stdout),
+            sn.assert_not_found(r'Traceback', self.stdout),
         ])
 
 

@@ -23,6 +23,15 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _raise_bcomplex32(*args, **kwargs):
+    """Stand-in for a torch op whose kernel is missing for a promoted complex dtype.
+
+    Reproduces the torch 2.14 CUDA failure from GitHub issue #43, where
+    bfloat16 promotes to the experimental BComplex32 dtype.
+    """
+    raise NotImplementedError('"mul_cuda" not implemented for \'BComplex32\'')
+
+
 class TestBenchmarkExecution:
     """Smoke tests that run benchmarks with minimal iterations."""
     
@@ -284,6 +293,94 @@ class TestBenchmarkExecution:
         
         assert result is not None
         assert result["min"] > 0
+
+    def test_schrodinger_unsupported_dtype_skips_gracefully(self, th, base_args, cpu_device, mock_telemetry, mock_telemetry_thread, mock_logger, mock_printer, monkeypatch):
+        """Schrödinger must skip with a warning, not crash, when the promoted complex dtype has no kernels."""
+        base_args.schrodinger = True
+        base_args.schrodinger_grid_size = 32
+        base_args.schrodinger_time_steps = 5
+        base_args.schrodinger_delta_x = 0.1
+        base_args.schrodinger_delta_t = 0.01
+        base_args.schrodinger_hbar = 1.0
+        base_args.schrodinger_mass = 1.0
+        base_args.schrodinger_potential = "harmonic"
+        base_args.precision_schrodinger = "bfloat16"
+        
+        monkeypatch.setattr(th.torch, "exp", _raise_bcomplex32)
+        monkeypatch.setattr(mock_logger, "warning", MagicMock())
+        monkeypatch.setattr(mock_logger, "error", MagicMock())
+        
+        mock_telemetry.reset_stats()
+        
+        result = th.schrodinger_equation(
+            base_args, cpu_device, mock_logger,
+            mock_telemetry, mock_telemetry_thread, mock_printer
+        )
+        
+        assert result is None
+        mock_logger.warning.assert_called_once()
+        warning_message = mock_logger.warning.call_args.args[0]
+        assert "not supported" in warning_message
+        assert "skipping" in warning_message
+        mock_logger.error.assert_not_called()
+
+    def test_schrodinger_float16_on_cpu_does_not_crash(self, th, base_args, cpu_device, mock_telemetry, mock_telemetry_thread, mock_logger, mock_printer, monkeypatch):
+        """float16 promotes to ComplexHalf, which lacks CPU exp kernels: either skip gracefully or run, never crash."""
+        base_args.schrodinger = True
+        base_args.schrodinger_grid_size = 32
+        base_args.schrodinger_time_steps = 5
+        base_args.schrodinger_delta_x = 0.1
+        base_args.schrodinger_delta_t = 0.01
+        base_args.schrodinger_hbar = 1.0
+        base_args.schrodinger_mass = 1.0
+        base_args.schrodinger_potential = "harmonic"
+        base_args.precision_schrodinger = "float16"
+        
+        monkeypatch.setattr(mock_logger, "warning", MagicMock())
+        monkeypatch.setattr(mock_logger, "error", MagicMock())
+        
+        mock_telemetry.reset_stats()
+        
+        result = th.schrodinger_equation(
+            base_args, cpu_device, mock_logger,
+            mock_telemetry, mock_telemetry_thread, mock_printer
+        )
+        
+        mock_logger.error.assert_not_called()
+        assert result is None or result["unit"] == "iter/s"
+        if result is None:
+            mock_logger.warning.assert_called_once()
+            warning_message = mock_logger.warning.call_args.args[0]
+            assert "not supported" in warning_message
+            assert "skipping" in warning_message
+
+    def test_schrodinger_bfloat16_on_cpu_does_not_crash(self, th, base_args, cpu_device, mock_telemetry, mock_telemetry_thread, mock_logger, mock_printer, monkeypatch):
+        """bfloat16 must either run (complex64 promotion) or skip gracefully (BComplex32 without kernels), never crash."""
+        base_args.schrodinger = True
+        base_args.schrodinger_grid_size = 32
+        base_args.schrodinger_time_steps = 5
+        base_args.schrodinger_delta_x = 0.1
+        base_args.schrodinger_delta_t = 0.01
+        base_args.schrodinger_hbar = 1.0
+        base_args.schrodinger_mass = 1.0
+        base_args.schrodinger_potential = "harmonic"
+        base_args.precision_schrodinger = "bfloat16"
+        
+        monkeypatch.setattr(mock_logger, "info", MagicMock())
+        monkeypatch.setattr(mock_logger, "error", MagicMock())
+        
+        mock_telemetry.reset_stats()
+        
+        result = th.schrodinger_equation(
+            base_args, cpu_device, mock_logger,
+            mock_telemetry, mock_telemetry_thread, mock_printer
+        )
+        
+        mock_logger.error.assert_not_called()
+        assert result is None or result["unit"] == "iter/s"
+        if result is not None:
+            info_messages = [str(call.args[0]) for call in mock_logger.info.call_args_list]
+            assert any("complex dtype" in message for message in info_messages)
 
     def test_atomic_contention_runs(self, th, base_args, cpu_device, mock_telemetry, mock_telemetry_thread, mock_logger, mock_printer):
         """Atomic contention benchmark should run without errors on CPU."""
