@@ -4,16 +4,17 @@
 # supported precisions with aggressive parameters. Designed for full
 # platform characterization and regression testing.
 #
-# Uses --stress-test to auto-size tensors to fill available GPU memory,
-# and --duration to run each benchmark for a fixed wall-clock window.
+# Stress sizing is enabled in the file itself (stress_test: true) so tensors
+# auto-size to fill available GPU memory, and each benchmark runs for a fixed
+# wall-clock window (duration: 30).
 #
 # Usage:
 #   python torch-hammer.py --config config-examples/platform-stress.yaml \
-#       --stress-test --all-gpus --json-output results.json
+#       --all-gpus --json-output results.json
 #
 # Quick single-GPU run:
 #   python torch-hammer.py --config config-examples/platform-stress.yaml \
-#       --stress-test --device-index 0 --summary-csv summary.csv
+#       --device-index 0 --summary-csv summary.csv
 #
 # Precision coverage:
 #   Standard benchmarks: bfloat16, float16, float32, float64, complex64, complex128
@@ -29,6 +30,7 @@ description: "Full precision sweep across all benchmarks — auto-sized to fill 
 global:
   warmup: 10
   duration: 30
+  stress_test: true   # auto-size every benchmark to fill available memory
   all_gpus: true
   verbose: true
 

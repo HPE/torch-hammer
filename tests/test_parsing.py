@@ -502,6 +502,68 @@ class TestApplyConfigToArgs:
         args = self._apply(th, parser, {"global": {"syslog-dmesg": True}})
         assert args.syslog_dmesg is True
 
+    def _apply_with_cli(self, th, parser, cli_flags, config):
+        """Helper: parse the given CLI flags (mirrored into sys.argv), apply config, return args."""
+        import sys
+        orig = sys.argv
+        sys.argv = ["torch-hammer.py"] + cli_flags
+        try:
+            args = parser.parse_args(cli_flags)
+            return th.apply_config_to_args(args, config)
+        finally:
+            sys.argv = orig
+
+    # ── Booleans whose parser default is True (#29) ──────────────────────
+
+    def test_yaml_false_overrides_true_default(self, th, parser):
+        """cpu_affinity: false in YAML global should disable the True-by-default flag."""
+        args = self._apply(th, parser, {"global": {"cpu_affinity": False}})
+        assert args.cpu_affinity is False
+
+    def test_negated_key_true_disables(self, th, parser):
+        """no_cpu_affinity: true (either spelling) should map to args.cpu_affinity = False."""
+        args = self._apply(th, parser, {"global": {"no_cpu_affinity": True}})
+        assert args.cpu_affinity is False
+        args = self._apply(th, parser, {"global": {"no-cpu-affinity": True}})
+        assert args.cpu_affinity is False
+
+    def test_negated_key_false_keeps_enabled(self, th, parser):
+        """no_cpu_affinity: false should leave affinity enabled."""
+        args = self._apply(th, parser, {"global": {"no_cpu_affinity": False}})
+        assert args.cpu_affinity is True
+
+    def test_cli_negated_flag_beats_yaml(self, th, parser):
+        """CLI --no-cpu-affinity must win over YAML cpu_affinity: true."""
+        args = self._apply_with_cli(th, parser, ["--no-cpu-affinity"], {"global": {"cpu_affinity": True}})
+        assert args.cpu_affinity is False
+
+    def test_cli_positive_flag_beats_yaml_false(self, th, parser):
+        """CLI --cpu-affinity must win over YAML cpu_affinity: false."""
+        args = self._apply_with_cli(th, parser, ["--cpu-affinity"], {"global": {"cpu_affinity": False}})
+        assert args.cpu_affinity is True
+
+    def test_yaml_false_disables_verbose(self, th, parser):
+        """verbose: false in YAML global should leave verbose off."""
+        args = self._apply(th, parser, {"global": {"verbose": False}})
+        assert args.verbose is False
+
+    # ── duration under global: (#30) ─────────────────────────────────────
+
+    def test_duration_in_global_section(self, th, parser):
+        """duration under global: should be applied, not silently ignored."""
+        args = self._apply(th, parser, {"global": {"duration": 30}})
+        assert args.duration == 30
+
+    def test_duration_in_runtime_section_still_works(self, th, parser):
+        """duration under runtime: must keep working."""
+        args = self._apply(th, parser, {"runtime": {"duration": 30}})
+        assert args.duration == 30
+
+    def test_cli_duration_beats_yaml(self, th, parser):
+        """CLI --duration must win over YAML global duration."""
+        args = self._apply_with_cli(th, parser, ["--duration", "5"], {"global": {"duration": 30}})
+        assert args.duration == 5.0
+
 
 class TestConfigGet:
     """Tests for the _config_get helper function."""
@@ -626,3 +688,58 @@ class TestConfigDispatchKeys:
         assert args.benchmark_list[0].get('precision_gemm') == 'bfloat16'
         assert args.benchmark_list[2]['name'] == 'batched_gemm'
         assert args.benchmark_list[2].get('precision_gemm') == 'float32'
+
+
+class TestStressFromConfig:
+    """Tests for stress-test sizing reaching benchmarks that come from a config file (#30)."""
+
+    def _apply(self, th, parser, config):
+        """Helper: parse empty CLI, apply config, return args."""
+        import sys
+        orig = sys.argv
+        sys.argv = ["torch-hammer.py"]
+        try:
+            args = parser.parse_args([])
+            return th.apply_config_to_args(args, config)
+        finally:
+            sys.argv = orig
+
+    def test_apply_stress_params_heat_enlarges_grid(self, th, parser):
+        """apply_stress_params('heat') should grow the grid beyond the 128 default."""
+        from unittest.mock import MagicMock
+        args = parser.parse_args([])
+        args.precision_heat = "float32"
+        th.apply_stress_params(args, "heat", 8000.0, MagicMock())
+        assert args.heat_grid_size > 128
+
+    def test_apply_stress_params_gemm_sets_dims(self, th, parser):
+        """apply_stress_params('gemm') should replace the default M/N/K and batch count."""
+        from unittest.mock import MagicMock
+        default_dims = (parser.get_default("m"), parser.get_default("n"), parser.get_default("k"))
+        args = parser.parse_args([])
+        args.precision_gemm = "float32"
+        th.apply_stress_params(args, "gemm", 8000.0, MagicMock())
+        assert args.m > 0
+        assert args.batch_count_gemm > 0
+        assert (args.m, args.n, args.k) != default_dims
+
+    def test_stress_test_from_yaml_global_survives_with_benchmarks(self, th, parser):
+        """stress_test: true under global: must survive when a benchmarks: list is present."""
+        config = {
+            "global": {"stress_test": True},
+            "benchmarks": [{"name": "heat_equation", "precision": "float32"}],
+        }
+        args = self._apply(th, parser, config)
+        assert args.stress_test is True
+        assert len(args.benchmark_list) == 1
+
+    def test_platform_stress_yaml_enables_stress_and_duration(self, th, parser):
+        """platform-stress.yaml should turn on stress sizing and the 30s duration by itself."""
+        import os
+        config_path = os.path.join(os.path.dirname(__file__), '..', 'config-examples', 'platform-stress.yaml')
+        if not os.path.exists(config_path):
+            pytest.skip("platform-stress.yaml not found")
+        config = th.load_config(config_path)
+        args = self._apply(th, parser, config)
+        assert args.stress_test is True
+        assert args.duration == 30
