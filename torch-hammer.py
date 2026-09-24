@@ -2782,6 +2782,26 @@ def schrodinger_equation(a, dev, log, tel, tel_thread, prn):
         dtype = getattr(torch, a.precision_schrodinger)
         dtype_str = str(dtype).split(".")[-1]
 
+        # Probe the complex arithmetic this benchmark needs on a tiny tensor.
+        # `1j * x` promotes real dtypes to a complex dtype whose kernel support
+        # depends on the device and torch version (e.g. bfloat16 -> BComplex32
+        # has no CUDA kernels on torch 2.14; float16 -> ComplexHalf has no CPU
+        # exp). Skip gracefully instead of crashing mid-run.  (GitHub issue #43)
+        try:
+            xp = torch.linspace(-1, 1, 4, device=dev, dtype=dtype)
+            ψp = torch.exp(-xp**2) * torch.exp(1j * xp)
+            ψp += 0.1 * (-1j * ((ψp.roll(-1, 0) - 2 * ψp + ψp.roll(1, 0)) + ψp))
+            complex_dtype_str = str(ψp.dtype).split(".")[-1]
+            del xp, ψp
+            if dev.type == "cuda":
+                torch.cuda.empty_cache()
+        except (RuntimeError, NotImplementedError, TypeError) as e:
+            reason = " ".join(str(e).split())
+            log.warning(f"[{dev_lbl} Schrödinger Equation] dtype {dtype_str} not supported for complex wave-function "
+                        f"arithmetic on this device: {reason}; skipping")
+            return None
+        log.info(f"[{dev_lbl} Schrödinger Equation] Using complex dtype {complex_dtype_str} for wave function")
+
         log.info(f"[{dev_lbl} Schrödinger] Allocating grid ({N} points)...")
         x = torch.linspace(-10, 10, N, device=dev, dtype=dtype)
         ψ = torch.exp(-x**2) * torch.exp(1j * x)
