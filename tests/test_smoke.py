@@ -32,6 +32,15 @@ def _raise_bcomplex32(*args, **kwargs):
     raise NotImplementedError('"mul_cuda" not implemented for \'BComplex32\'')
 
 
+def _raise_unsupported_fft_dtype(*args, **kwargs):
+    """Stand-in for torch.fft.fftn on a backend without half-precision FFT kernels.
+
+    Reproduces the CPU and ROCm failure from GitHub issue #45, where
+    torch.fft has no bfloat16/float16 kernels (cuFFT on CUDA has them).
+    """
+    raise RuntimeError("Unsupported dtype BFloat16")
+
+
 class TestBenchmarkExecution:
     """Smoke tests that run benchmarks with minimal iterations."""
     
@@ -171,6 +180,60 @@ class TestBenchmarkExecution:
         assert result is not None
         assert result["min"] > 0
         assert result["mean"] > 0
+
+    def test_fft_unsupported_dtype_skips_gracefully(self, th, base_args, cpu_device, mock_telemetry, mock_telemetry_thread, mock_logger, mock_printer, monkeypatch):
+        """FFT must skip with a warning, not crash, when torch.fft has no kernels for the dtype."""
+        base_args.fft = True
+        base_args.batch_count_fft = 1
+        base_args.nx = 8
+        base_args.ny = 8
+        base_args.nz = 8
+        base_args.precision_fft = "bfloat16"
+        
+        monkeypatch.setattr(th.torch.fft, "fftn", _raise_unsupported_fft_dtype)
+        monkeypatch.setattr(mock_logger, "warning", MagicMock())
+        monkeypatch.setattr(mock_logger, "error", MagicMock())
+        
+        mock_telemetry.reset_stats()
+        
+        result = th.fft_test(
+            base_args, cpu_device, mock_logger,
+            mock_telemetry, mock_telemetry_thread, mock_printer
+        )
+        
+        assert result is None
+        mock_logger.warning.assert_called_once()
+        warning_message = mock_logger.warning.call_args.args[0]
+        assert "not supported" in warning_message
+        assert "skipping" in warning_message
+        mock_logger.error.assert_not_called()
+
+    def test_fft_bfloat16_on_cpu_does_not_crash(self, th, base_args, cpu_device, mock_telemetry, mock_telemetry_thread, mock_logger, mock_printer, monkeypatch):
+        """bfloat16 FFT must either run (cuFFT) or skip gracefully (no CPU/ROCm kernels), never crash."""
+        base_args.fft = True
+        base_args.batch_count_fft = 1
+        base_args.nx = 8
+        base_args.ny = 8
+        base_args.nz = 8
+        base_args.precision_fft = "bfloat16"
+        
+        monkeypatch.setattr(mock_logger, "warning", MagicMock())
+        monkeypatch.setattr(mock_logger, "error", MagicMock())
+        
+        mock_telemetry.reset_stats()
+        
+        result = th.fft_test(
+            base_args, cpu_device, mock_logger,
+            mock_telemetry, mock_telemetry_thread, mock_printer
+        )
+        
+        mock_logger.error.assert_not_called()
+        assert result is None or result["unit"] == "GFLOP/s"
+        if result is None:
+            mock_logger.warning.assert_called_once()
+            warning_message = mock_logger.warning.call_args.args[0]
+            assert "not supported" in warning_message
+            assert "skipping" in warning_message
     
     def test_einsum_runs(self, th, base_args, cpu_device, mock_telemetry, mock_telemetry_thread, mock_logger, mock_printer):
         """Einsum attention benchmark should run without errors on CPU."""

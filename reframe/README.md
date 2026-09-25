@@ -182,6 +182,15 @@ CI pipelines.  It covers **every benchmark × precision × parameter
 combination** (92 tests total) using deliberately tiny tensor sizes so the
 full suite finishes in minutes.
 
+Every check in both suites (`ci_functional_checks.py` and
+`torch_hammer_checks.py`) fails if a Python traceback appears in stdout or
+stderr.  torch-hammer prints `[OK] Benchmark run finished` even when a
+benchmark crashed, so asserting the benchmark name plus `[OK]` alone was
+satisfied by the crash itself.  Graceful skips (`not supported … skipping`)
+remain acceptable where a benchmark cannot run a dtype on a backend (Atomic,
+Sparse, Schrödinger, FFT); a traceback never is.  The GitHub Actions workflow
+passes `--nocolor` so the ReFrame logs stay greppable.
+
 ### Test Breakdown (92 tests)
 
 | Check class | Parameters | Count |
