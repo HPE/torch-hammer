@@ -18,6 +18,20 @@ import reframe as rfm
 import reframe.utility.sanity as sn
 
 
+def _no_traceback(check):
+    """A Python traceback in either output stream is never an acceptable outcome.
+
+    torch-hammer logs to stdout in normal mode and to stderr under --compact, and
+    it prints '[OK] Benchmark run finished' even when a benchmark crashed, so a
+    sanity check that only looks for the benchmark name and '[OK]' is satisfied
+    by the crash itself.  (GitHub issue #45)
+    """
+    return sn.all([
+        sn.assert_not_found(r'Traceback', check.stdout),
+        sn.assert_not_found(r'Traceback', check.stderr),
+    ])
+
+
 class TorchHammerBase(rfm.RunOnlyRegressionTest):
     """Base class for all Torch Hammer benchmarks."""
     
@@ -57,8 +71,11 @@ class TorchHammerBase(rfm.RunOnlyRegressionTest):
     
     @sanity_function
     def validate_run(self):
-        """Validate that the benchmark completed successfully."""
-        return sn.assert_found(r'\[OK\] Benchmark run finished', self.stdout)
+        """Validate that the benchmark completed successfully and no benchmark crashed."""
+        return sn.all([
+            sn.assert_found(r'\[OK\] Benchmark run finished', self.stdout),
+            _no_traceback(self),
+        ])
 
 
 # ============================================================================
@@ -456,7 +473,7 @@ class TorchHammerFullSuite(TorchHammerBase):
     
     @sanity_function
     def validate_full_run(self):
-        """Validate that all benchmarks completed."""
+        """Validate that all benchmarks completed and none of them crashed."""
         return sn.all([
             sn.assert_found(r'Batched GEMM', self.stdout),
             sn.assert_found(r'Convolution', self.stdout),
@@ -465,6 +482,7 @@ class TorchHammerFullSuite(TorchHammerBase):
             sn.assert_found(r'Memory Traffic', self.stdout),
             sn.assert_found(r'Heat Equation', self.stdout),
             sn.assert_found(r'Schr.dinger Equation', self.stdout),
+            _no_traceback(self),
         ])
     
     @performance_function('GFLOP/s')
@@ -528,11 +546,12 @@ class TorchHammerMultiGPU(TorchHammerBase):
     
     @sanity_function
     def validate_multi_gpu(self):
-        """Validate all GPUs completed."""
+        """Validate all GPUs completed and none of them crashed."""
         # Check that we see output from all GPUs
         # device_label() outputs "GPU0", "GPU1" etc. (no space)
         checks = [
             sn.assert_found(rf'\[GPU{i}\b', self.stdout) 
             for i in range(self.num_gpus)
         ]
+        checks.append(_no_traceback(self))
         return sn.all(checks)

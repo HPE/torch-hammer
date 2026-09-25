@@ -17,6 +17,10 @@ in minutes rather than hours.  They validate:
   • Output-mode variants (compact CSV, JSON, dry-run, etc.) work end-to-end
   • Multi-flag combinations (repeats, shuffle, stress-test) don't crash
 
+Every check also fails if a Python traceback appears in stdout or stderr:
+torch-hammer prints '[OK] Benchmark run finished' even after a benchmark
+crashed, so the [OK] banner alone proves nothing (see _no_traceback).
+
 Usage (local):
     reframe -C reframe/settings.py -c reframe/ci_functional_checks.py -r -t ci
 
@@ -57,6 +61,20 @@ Test count breakdown (92 tests):
 import os
 import reframe as rfm
 import reframe.utility.sanity as sn
+
+
+def _no_traceback(check):
+    """A Python traceback in either output stream is never an acceptable outcome.
+
+    torch-hammer logs to stdout in normal mode and to stderr under --compact, and
+    it prints '[OK] Benchmark run finished' even when a benchmark crashed, so a
+    sanity check that only looks for the benchmark name and '[OK]' is satisfied
+    by the crash itself.  (GitHub issue #45)
+    """
+    return sn.all([
+        sn.assert_not_found(r'Traceback', check.stdout),
+        sn.assert_not_found(r'Traceback', check.stderr),
+    ])
 
 
 # ── precision sets (mirrors build_parser() in torch-hammer.py) ───────
@@ -108,9 +126,10 @@ class TorchHammerCIBase(rfm.RunOnlyRegressionTest):
 
     @sanity_function
     def validate_run(self):
-        return sn.assert_found(
-            r'\[OK\] Benchmark run finished', self.stdout,
-        )
+        return sn.all([
+            sn.assert_found(r'\[OK\] Benchmark run finished', self.stdout),
+            _no_traceback(self),
+        ])
 
 
 # =====================================================================
@@ -141,6 +160,7 @@ class CI_GEMM(TorchHammerCIBase):
                 r'\[GPU\d+\s+Batched GEMM\]\s+Performance:', self.stdout,
             ),
             sn.assert_found(r'\[OK\] Benchmark run finished', self.stdout),
+            _no_traceback(self),
         ])
 
     @performance_function('GFLOP/s')
@@ -177,6 +197,7 @@ class CI_GEMM_TF32(TorchHammerCIBase):
                 r'\[GPU\d+\s+Batched GEMM\]\s+Performance:', self.stdout,
             ),
             sn.assert_found(r'\[OK\] Benchmark run finished', self.stdout),
+            _no_traceback(self),
         ])
 
     @performance_function('GFLOP/s')
@@ -218,6 +239,7 @@ class CI_Conv(TorchHammerCIBase):
                 r'\[GPU\d+\s+Convolution\]\s+Performance:', self.stdout,
             ),
             sn.assert_found(r'\[OK\] Benchmark run finished', self.stdout),
+            _no_traceback(self),
         ])
 
     @performance_function('img/s')
@@ -252,12 +274,23 @@ class CI_FFT(TorchHammerCIBase):
 
     @sanity_function
     def validate_run(self):
-        """FFT must produce a Performance line or a graceful error.
-        On some backends (e.g. ROCm + bfloat16) FFT fails with an error
-        message containing '3-D FFT'; on success it prints '3D FFT'."""
+        """FFT must produce a Performance line or skip gracefully where
+        torch.fft lacks kernels for the dtype (half precision on CPU and
+        ROCm; cuFFT on CUDA supports every dtype).  A Python traceback is
+        never acceptable.
+
+        The two acceptable outcomes are one regex alternation, not
+        ``sn.any([assert_found(...), assert_found(...)])``: ``assert_found``
+        raises SanityError on a miss, so ``sn.any`` over it is not an OR."""
         return sn.all([
             sn.assert_found(r'3-?D FFT', self.stdout),
+            sn.assert_found(
+                r'\[GPU\d+\s+3D FFT\]\s+Performance:'
+                r'|3-D FFT\].*not supported.*skipping',
+                self.stdout,
+            ),
             sn.assert_found(r'\[OK\] Benchmark run finished', self.stdout),
+            _no_traceback(self),
         ])
 
     @performance_function('GFLOP/s')
@@ -297,6 +330,7 @@ class CI_Einsum(TorchHammerCIBase):
                 r'\[GPU\d+\s+Einsum Attention\]\s+Performance:', self.stdout,
             ),
             sn.assert_found(r'\[OK\] Benchmark run finished', self.stdout),
+            _no_traceback(self),
         ])
 
     @performance_function('GFLOP/s')
@@ -338,6 +372,7 @@ class CI_Memory(TorchHammerCIBase):
                 r'\[GPU\d+\s+Memory Traffic\]\s+Performance:', self.stdout,
             ),
             sn.assert_found(r'\[OK\] Benchmark run finished', self.stdout),
+            _no_traceback(self),
         ])
 
     @performance_function('GB/s')
@@ -377,6 +412,7 @@ class CI_Heat(TorchHammerCIBase):
                 r'\[GPU\d+\s+Heat Equation\]\s+Performance:', self.stdout,
             ),
             sn.assert_found(r'\[OK\] Benchmark run finished', self.stdout),
+            _no_traceback(self),
         ])
 
     @performance_function('MLUPS')
@@ -429,8 +465,8 @@ class CI_Schrodinger(TorchHammerCIBase):
                 r'|Schr.dinger Equation\].*not supported.*skipping',
                 self.stdout,
             ),
-            sn.assert_not_found(r'Traceback', self.stdout),
             sn.assert_found(r'\[OK\] Benchmark run finished', self.stdout),
+            _no_traceback(self),
         ])
 
     @performance_function('iter/s')
@@ -466,26 +502,20 @@ class CI_Atomic(TorchHammerCIBase):
 
     @sanity_function
     def validate_run(self):
-        """Atomic must produce a Performance line or a graceful skip.
-        We require the benchmark name to appear (proving it was attempted)
-        and either a Performance line, a skip/warning, or a known error."""
+        """Atomic must produce a Performance line or skip gracefully
+        (unsupported dtype for scatter_add_, or estimated memory exceeding
+        what is available).  A Python traceback is never acceptable."""
         return sn.all([
             sn.assert_found(r'Atomic Contention', self.stdout),
-            sn.any([
-                sn.assert_found(
-                    r'\[GPU\d+\s+Atomic Contention\]\s+Performance:',
-                    self.stdout,
-                ),
-                # Graceful skip/warning goes to stdout via log.warning
-                sn.assert_found(
-                    r'Atomic Contention.*skipping|Atomic Contention.*not supported',
-                    self.stdout,
-                ),
-                sn.assert_found(
-                    r'FAILED|Error|not supported|RuntimeError',
-                    self.stderr,
-                ),
-            ]),
+            # Performance line, or a graceful skip (dtype/memory) — one regex, because
+            # sn.any() over assert_found() is not an OR: assert_found raises on a miss.
+            sn.assert_found(
+                r'\[GPU\d+\s+Atomic Contention\]\s+Performance:'
+                r'|Atomic Contention\].*(not supported|skipping)',
+                self.stdout,
+            ),
+            sn.assert_found(r'\[OK\] Benchmark run finished', self.stdout),
+            _no_traceback(self),
         ])
 
     @performance_function('Mops/s')
@@ -530,6 +560,7 @@ class CI_Sparse(TorchHammerCIBase):
                 r'\[GPU\d+\s+Sparse MM\]\s+Performance:',
                 self.stdout,
             ),
+            _no_traceback(self),
         ])
 
     @performance_function('GFLOP/s')
@@ -622,7 +653,7 @@ class CI_PrecisionMatrixStandard(TorchHammerCIBase):
             sn.assert_found(r'Heat Equation', self.stdout),
             sn.assert_found(r'Schr.dinger Equation', self.stdout),
             sn.assert_found(r'\[OK\] Benchmark run finished', self.stdout),
-            sn.assert_not_found(r'Traceback', self.stdout),
+            _no_traceback(self),
         ])
 
 
@@ -722,7 +753,7 @@ class CI_PrecisionMatrixAll(TorchHammerCIBase):
             sn.assert_found(r'Atomic Contention', self.stdout),
             sn.assert_found(r'Sparse MM', self.stdout),
             sn.assert_found(r'\[OK\] Benchmark run finished', self.stdout),
-            sn.assert_not_found(r'Traceback', self.stdout),
+            _no_traceback(self),
         ])
 
 
@@ -763,6 +794,7 @@ class CI_PrecisionMatrixAtomic(TorchHammerCIBase):
             sn.assert_found(r'Batched GEMM', self.stdout),
             sn.assert_found(r'Atomic Contention', self.stdout),
             sn.assert_found(r'\[OK\] Benchmark run finished', self.stdout),
+            _no_traceback(self),
         ])
 
 
@@ -802,6 +834,7 @@ class CI_PrecisionMatrixSparse(TorchHammerCIBase):
             sn.assert_found(r'Batched GEMM', self.stdout),
             sn.assert_found(r'Sparse MM', self.stdout),
             sn.assert_found(r'\[OK\] Benchmark run finished', self.stdout),
+            _no_traceback(self),
         ])
 
 
@@ -866,6 +899,7 @@ class CI_FullSuite(TorchHammerCIBase):
             sn.assert_found(r'Atomic Contention', self.stdout),
             sn.assert_found(r'Sparse MM', self.stdout),
             sn.assert_found(r'\[OK\] Benchmark run finished', self.stdout),
+            _no_traceback(self),
         ])
 
 
@@ -900,8 +934,7 @@ class CI_CompactCSV(TorchHammerCIBase):
             sn.assert_found(r'dtype', self.stdout),
             # At least one data row with the benchmark name
             sn.assert_found(r'Batched GEMM', self.stdout),
-            # Ensure no Python crash
-            sn.assert_not_found(r'Traceback', self.stderr),
+            _no_traceback(self),
         ])
 
 
@@ -932,7 +965,7 @@ class CI_CompactVerbose(TorchHammerCIBase):
             sn.assert_found(r'Batched GEMM', self.stdout),
             # Verbose adds telemetry columns to the header;
             # accept even if telemetry columns are absent on some platforms.
-            sn.assert_not_found(r'Traceback', self.stderr),
+            _no_traceback(self),
         ])
 
 
@@ -963,6 +996,7 @@ class CI_JSONOutput(TorchHammerCIBase):
                 r'JSON results exported to: ci_test_output_.*\.json',
                 self.stdout,
             ),
+            _no_traceback(self),
         ])
 
 
@@ -993,6 +1027,7 @@ class CI_DryRun(TorchHammerCIBase):
             sn.assert_found(r'Convolution', self.stdout),
             sn.assert_found(r'3-D FFT|3D FFT', self.stdout),
             sn.assert_found(r'END DRY RUN', self.stdout),
+            _no_traceback(self),
         ])
 
 
@@ -1028,6 +1063,7 @@ class CI_Repeats(TorchHammerCIBase):
                 2,
             ),
             sn.assert_found(r'\[OK\] Benchmark run finished', self.stdout),
+            _no_traceback(self),
         ])
 
 
@@ -1050,9 +1086,10 @@ class CI_ConfigYAML(TorchHammerCIBase):
 
     @sanity_function
     def validate_run(self):
-        return sn.assert_found(
-            r'\[OK\] Benchmark run finished', self.stdout,
-        )
+        return sn.all([
+            sn.assert_found(r'\[OK\] Benchmark run finished', self.stdout),
+            _no_traceback(self),
+        ])
 
 
 @rfm.simple_test
@@ -1075,6 +1112,7 @@ class CI_StressTest(TorchHammerCIBase):
         return sn.all([
             sn.assert_found(r'Stress Test', self.stdout),
             sn.assert_found(r'\[OK\] Benchmark run finished', self.stdout),
+            _no_traceback(self),
         ])
 
 
@@ -1104,4 +1142,5 @@ class CI_Shuffle(TorchHammerCIBase):
             sn.assert_found(r'Batched GEMM', self.stdout),
             sn.assert_found(r'Memory Traffic', self.stdout),
             sn.assert_found(r'\[OK\] Benchmark run finished', self.stdout),
+            _no_traceback(self),
         ])

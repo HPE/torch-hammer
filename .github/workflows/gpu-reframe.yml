@@ -79,6 +79,7 @@ jobs:
             -C reframe/settings.py \
             -c reframe/ci_functional_checks.py \
             -r \
+            --nocolor \
             -t ci -t ${{ matrix.tag }} \
             --performance-report
 

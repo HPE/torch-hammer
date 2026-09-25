@@ -2524,6 +2524,18 @@ def fft_test(a, dev, log, tel, tel_thread, prn):
         dtype = getattr(torch, a.precision_fft)
         dtype_str = str(dtype).split(".")[-1]
 
+        # Probe the FFT on a tiny tensor first. torch.fft has no half-precision
+        # kernels on CPU and ROCm (cuFFT on CUDA supports every dtype torch-hammer
+        # offers), so skip gracefully instead of crashing mid-run.  (GitHub issue #45)
+        try:
+            torch.fft.fftn(torch.rand(2, 2, 2, device=dev, dtype=dtype))
+            if dev.type == "cuda":
+                torch.cuda.empty_cache()
+        except (RuntimeError, NotImplementedError, TypeError) as e:
+            reason = " ".join(str(e).split())
+            log.warning(f"[{dev_lbl} 3-D FFT] dtype {dtype_str} not supported for FFT on this device: {reason}; skipping")
+            return None
+
         log.info(f"[{dev_lbl} FFT] Allocating tensors ({B}x{NX}x{NY}x{NZ})...")
         x = torch.rand(B, NX, NY, NZ, device=dev, dtype=dtype)
         # FFT flops: 5*N*log2(N) per dimension - assumes power-of-2 for radix-2 FFT
