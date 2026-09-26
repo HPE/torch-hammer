@@ -240,7 +240,8 @@ The most important switches are summarised below (defaults in _italics_).
 | `--syslog-dmesg` | Also write syslog messages to `/dev/kmsg` (requires `--syslog`). Needs root or `CAP_SYSLOG`. |
 | `--banner` | Show ASCII banner at startup. |
 | `--json-output <path>` | Write all results and telemetry to a JSON file. |
-| `--summary-csv <path>` | Write benchmark summary table to a CSV file. |
+| `--summary-csv <path>` | Write the benchmark summary table (10 columns) to a CSV file on single- or multi-GPU runs. `<hostname>_<timestamp>` is inserted into the filename. |
+| `--csv-output <path>` | Write the compact CSV (same columns as `--compact`) to a file; stdout keeps the normal layout. `<hostname>_<timestamp>` is inserted into the filename. See [CSV to a File](#csv-to-a-file---csv-output). |
 | **Configuration** | |
 | `--config <path>` | Path to YAML configuration file (see [YAML Configuration](#yaml-configuration)). |
 | `--list-profiles` | List available configuration profiles and exit. |
@@ -688,11 +689,34 @@ summary.
 ./torch-hammer.py --compact --all-gpus --batched-gemm > results.csv
 ```
 
+### CSV to a File (`--csv-output`)
+
+`--csv-output <path>` writes the **same 14 (or 19 with `--verbose`) columns** to a
+file while stdout keeps the normal human-readable layout — no need to choose
+between watching a run and recording it.
+
+```bash
+# Normal console output, plus one compact row per benchmark in results_<hostname>_<timestamp>.csv
+./torch-hammer.py --batched-gemm --fft --csv-output results.csv
+
+# Combine with --compact: identical rows on stdout and in the file
+./torch-hammer.py --compact --batched-gemm --csv-output results.csv
+```
+
+- `<hostname>_<timestamp>` is inserted before the suffix so nodes writing to a
+  shared filesystem never collide.
+- Multi-GPU (`--all-gpus` / `--gpu-list`): the parent writes one header, each
+  worker appends its rows; row order **across GPUs is not guaranteed**.
+- The file is a valid input for `reports/hammer_report.py`.
+- Per-iteration data is **not** included — use `--json-output`, or
+  `--log-dir --verbose` for per-iteration lines.
+- Also available from YAML as `csv_output:` under `global:`.
+
 ### Behavior Notes
 
 - **stdout** = pure CSV (header + data rows).  
 - **stderr** = warnings / errors only (log level `WARNING`).  
-- `--compact` does **not** emit per-iteration lines; only `--verbose` does.  
+- Neither `--compact` nor `--csv-output` emits per-iteration lines; only `--verbose` does.  
 - Combine `--compact --verbose` to get extra telemetry **columns** on the summary row (not extra rows).
 
 ---

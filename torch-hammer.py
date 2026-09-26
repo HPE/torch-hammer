@@ -113,7 +113,7 @@ if "OMP_NUM_THREADS" not in os.environ:
     os.environ["OMP_PLACES"] = "cores"
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple
 import multiprocessing
 import threading
 
@@ -1438,6 +1438,208 @@ def _emit_compact_csv(row: dict, verbose: bool = False,
     print(buf.getvalue().rstrip("\r\n"), file=out, flush=True)
 
 
+def _compact_row(perf: dict, tel_data: dict, gpu_index: int,
+                 hostname: str, verbose: bool = False) -> dict:
+    """Build the compact CSV row for one finished benchmark.
+
+    Pure function shared by ``--compact`` (stdout) and ``--csv-output``
+    (file) so both channels carry byte-identical rows.
+    """
+    tel_s = perf.get('telemetry', {})
+    row = {
+        'hostname':       hostname,
+        'gpu':            gpu_index,
+        'gpu_model':      tel_data.get('model', ''),
+        'serial':         tel_data.get('serial', ''),
+        'benchmark':      perf['name'],
+        'dtype':          perf.get('params', {}).get('dtype', ''),
+        'iterations':     perf.get('iterations', ''),
+        'runtime_s':      perf.get('runtime_s', ''),
+        'min':            f"{perf['min']:.4f}",
+        'mean':           f"{perf['mean']:.4f}",
+        'max':            f"{perf['max']:.4f}",
+        'unit':           perf['unit'],
+        'power_avg_w':    f"{tel_s.get('power_W_mean', 0):.1f}" if tel_s.get('power_W_mean') else '',
+        'temp_max_c':     f"{tel_s.get('temp_gpu_C_max', 0):.0f}" if tel_s.get('temp_gpu_C_max') else '',
+    }
+    if verbose:
+        row.update({
+            'sm_util_mean':     f"{tel_s['sm_util_mean']:.0f}" if 'sm_util_mean' in tel_s else '',
+            'mem_bw_util_mean': f"{tel_s['mem_bw_util_mean']:.0f}" if 'mem_bw_util_mean' in tel_s else '',
+            'gpu_clock_mean':   f"{tel_s['gpu_clock_mean']:.0f}" if 'gpu_clock_mean' in tel_s else '',
+            'mem_used_gb_mean': f"{tel_s['mem_used_MB_mean'] / 1024:.2f}" if 'mem_used_MB_mean' in tel_s else '',
+            'throttled':        'true' if perf.get('throttled') else 'false',
+        })
+    return row
+
+
+def _unique_output_path(path: str) -> Path:
+    """Insert ``<hostname>_<timestamp>`` before the suffix of *path*.
+
+    Fleet runs write to a shared filesystem, so every node (and every run)
+    needs its own file for the same ``--csv-output`` / ``--summary-csv`` /
+    ``--json-output`` argument.
+    """
+    import socket
+    from datetime import datetime
+    hostname = socket.gethostname().split('.', 1)[0]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path_obj = Path(path)
+    return path_obj.with_name(f"{path_obj.stem}_{hostname}_{timestamp}{path_obj.suffix}")
+
+
+def _start_csv_output(path: str, verbose: bool = False) -> str:
+    """Create the ``--csv-output`` file with its header; return the unique path."""
+    csv_path = _unique_output_path(path)
+    with open(csv_path, 'w', newline='') as fh:
+        print(",".join(_compact_csv_columns(verbose)), file=fh)
+    return str(csv_path)
+
+
+def _append_csv_output_row(row: dict, path: str, verbose: bool = False) -> None:
+    """Append one compact row to the ``--csv-output`` file.
+
+    The file is opened per row so no handle outlives a single write:
+    multi-GPU workers append concurrently, and a crash mid-run leaves
+    every completed row on disk.
+    """
+    with open(path, 'a', newline='') as fh:
+        _emit_compact_csv(row, verbose=verbose, header=False, file=fh)
+
+
+# ───────────────────────────────────────────────────────────────────────
+# 4a″. SUMMARY TABLE / --summary-csv HELPERS  ─────────────────────────
+
+_SUMMARY_CSV_FIELDNAMES = ['test', 'dtype', 'gpu', 'serial', 'performance', 'unit',
+                           'power_avg_W', 'temp_max_C', 'status', 'notes']
+
+
+def _summary_status(bench: dict, tel_stats: dict, efficiency_warn_pct: float) -> Tuple[str, str]:
+    """Return ``(status, notes)`` for one benchmark on one GPU."""
+    throttled = tel_stats.get('throttled', False) or bench.get('telemetry', {}).get('throttled', False)
+    efficiency = bench.get('efficiency_pct', None)
+    if throttled:
+        return "FAIL", "Throttled"
+    if efficiency is not None and efficiency < efficiency_warn_pct:
+        return "FAIL", f"Low efficiency ({efficiency:.0f}%)"
+    return "PASS", ""
+
+
+def _summary_display_label(bench: dict, dtype: str) -> str:
+    """Table heading for a benchmark, with extra context when the same
+    benchmark may appear several times with different parameters."""
+    params = bench.get('params', {})
+    extra_parts = []
+    if 'pattern' in params:
+        extra_parts.append(params['pattern'])
+    if not extra_parts:
+        return f"{bench['name']} ({dtype})"
+    return f"{bench['name']} ({dtype}, {', '.join(extra_parts)})"
+
+
+def _mark_fastest(group_results: List[dict]) -> None:
+    """Annotate the fastest clean row(s) of a multi-GPU group with "Fastest"."""
+    if len(group_results) <= 1:
+        return
+    fastest_perf = max(r['performance'] for r in group_results)
+    for r in group_results:
+        if r['performance'] == fastest_perf and not r['notes']:
+            r['notes'] = "Fastest"
+
+
+def _group_summary_benchmarks(results: List[dict], efficiency_warn_pct: float) -> Dict[str, dict]:
+    """Group per-GPU benchmark results for the summary table and CSV.
+
+    Groups are keyed by position index + name + dtype so that distinct
+    config entries for the same benchmark (e.g. memory_traffic streaming
+    vs random) stay separate.  Each group's ``results`` are sorted by GPU
+    index and the fastest clean row is marked when >1 GPU ran the test.
+    """
+    groups: Dict[str, dict] = {}
+    for result in results:
+        gpu_idx = result['gpu_index']
+        serial = result.get('serial', 'N/A')
+        tel_stats = result.get('telemetry_stats', {})
+
+        for bench_idx, bench in enumerate(result.get('benchmarks', [])):
+            if not bench:
+                continue
+            dtype = bench.get('params', {}).get('dtype', 'unknown')
+            test_key = f"{bench_idx:03d}_{bench['name']}_{dtype}"
+            if test_key not in groups:
+                groups[test_key] = {
+                    'name': bench['name'],
+                    'dtype': dtype,
+                    'unit': bench['unit'],
+                    'display_label': _summary_display_label(bench, dtype),
+                    'results': [],
+                }
+            status, notes = _summary_status(bench, tel_stats, efficiency_warn_pct)
+            # Use per-benchmark telemetry if available, fallback to overall stats
+            bench_tel = bench.get('telemetry', {})
+            groups[test_key]['results'].append({
+                'gpu': gpu_idx,
+                'serial': serial,
+                'performance': bench['mean'],
+                'power_avg': bench_tel.get('power_W_mean', tel_stats.get('power_W_mean', 0)),
+                'temp_max': bench_tel.get('temp_gpu_C_max', tel_stats.get('temp_gpu_C_max', 0)),
+                'status': status,
+                'notes': notes,
+            })
+
+    for group in groups.values():
+        group['results'].sort(key=lambda r: r['gpu'])
+        _mark_fastest(group['results'])
+    return groups
+
+
+def _build_summary_rows(results: List[dict], efficiency_warn_pct: float) -> List[dict]:
+    """Flatten grouped results into ``--summary-csv`` rows.
+
+    Rows follow the summary table order (benchmark position, then GPU) and
+    carry exactly ``_SUMMARY_CSV_FIELDNAMES``.  Works for any number of
+    GPUs — a single-GPU run yields one row per benchmark.
+    """
+    groups = _group_summary_benchmarks(results, efficiency_warn_pct)
+    rows = []
+    for test_key in sorted(groups):
+        group = groups[test_key]
+        for r in group['results']:
+            rows.append({
+                'test': group['name'],
+                'dtype': group['dtype'],
+                'gpu': r['gpu'],
+                'serial': r['serial'],
+                'performance': r['performance'],
+                'unit': group['unit'],
+                'power_avg_W': r['power_avg'],
+                'temp_max_C': r['temp_max'],
+                'status': r['status'],
+                'notes': r['notes'],
+            })
+    return rows
+
+
+def _write_summary_csv(rows: List[dict], path: str, log) -> Optional[Path]:
+    """Write summary rows to ``_unique_output_path(path)``.
+
+    Returns the written path, or ``None`` (after a warning) when the file
+    cannot be created — results were already reported, so the run goes on.
+    """
+    import csv
+    csv_path = _unique_output_path(path)
+    try:
+        with open(csv_path, 'w', newline='') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=_SUMMARY_CSV_FIELDNAMES)
+            writer.writeheader()
+            writer.writerows(rows)
+    except OSError as e:
+        log.warning(f"Failed to export CSV summary: {e}")
+        return None
+    log.info(f"Summary exported to CSV: {csv_path}")
+    return csv_path
+
+
 # ───────────────────────────────────────────────────────────────────────
 # Syslog / dmesg structured output  (--syslog, --syslog-dmesg)
 # ───────────────────────────────────────────────────────────────────────
@@ -1574,7 +1776,7 @@ def _build_syslog_row(perf: dict, tel_data: dict, gpu_index: int,
                       run_id: str = "") -> dict:
     """Build a syslog KV row from a ``perf_summary`` dict.
 
-    Mirrors the logic in ``_maybe_emit_compact`` so that the syslog KV
+    Mirrors the logic in ``_compact_row`` so that the syslog KV
     fields are consistent with compact-mode CSV columns.
     """
     import socket
@@ -3311,7 +3513,7 @@ def apply_config_to_args(args, config):
             # Check if this looks like a default value that wasn't explicitly set
             if arg_name in ['warmup'] and current == 10:  # Default warmup
                 setattr(args, arg_name, value)
-            elif arg_name in ['log_file', 'log_dir', 'temp_dir'] and not current:
+            elif arg_name in ['log_file', 'log_dir', 'temp_dir', 'csv_output'] and not current:
                 setattr(args, arg_name, value)
     
     # Apply runtime settings (duration, iterations, thresholds)
@@ -3399,7 +3601,8 @@ def build_parser():
     p.add_argument("--min-iterations", type=int, default=10, help="Minimum iterations even if duration met")
     p.add_argument("--max-iterations", type=int, help="Maximum iterations regardless of duration")
     p.add_argument("--json-output", type=str, help="Path to output JSON file with all results and telemetry")
-    p.add_argument("--summary-csv", type=str, help="Path to output CSV file with benchmark summary table")
+    p.add_argument("--summary-csv", type=str, help="Write the benchmark summary table (10 columns) to a CSV file on single- or multi-GPU runs. '<hostname>_<timestamp>' is inserted into the filename.")
+    p.add_argument("--csv-output", type=str, help="Write the compact CSV (one row per benchmark, same columns as --compact; extra telemetry columns with --verbose) to a file while stdout keeps the normal layout. '<hostname>_<timestamp>' is inserted into the filename so nodes do not collide.")
     
     # Thermal/Performance thresholds (tunable across platforms)
     p.add_argument("--temp-warn-C", type=float, default=90.0, help="Temperature warning threshold in Celsius (default: 90)")
@@ -3818,44 +4021,29 @@ def run_single_gpu(args, gpu_index: int, log=None):
     _compact_header_needed = _compact  # emit header before first row
     _is_single = (not getattr(args, 'all_gpus', False)
                   and not getattr(args, 'gpu_list', None))
-    
+    # --csv-output: in multi-GPU mode the parent created the file (with
+    # header) and stashed its path on args; in single-GPU mode we own it.
+    _csv_output_path = getattr(args, '_csv_output_path', None)
+    _owns_csv_output = bool(getattr(args, 'csv_output', None)) and not _csv_output_path
+    if _owns_csv_output:
+        _csv_output_path = _start_csv_output(args.csv_output, args.verbose)
+
     def _maybe_emit_compact(perf):
-        """If --compact, emit a CSV row for the just-finished benchmark."""
+        """If --compact / --csv-output, emit a CSV row for the just-finished benchmark."""
         nonlocal _compact_header_needed
-        if not _compact or perf is None:
+        if perf is None or not (_compact or _csv_output_path):
             return
         import socket
         hostname = tel_data.get('hostname') or socket.gethostname().split('.', 1)[0]
-        tel_s = perf.get('telemetry', {})
-        row = {
-            'hostname':       hostname,
-            'gpu':            gpu_index,
-            'gpu_model':      tel_data.get('model', ''),
-            'serial':         tel_data.get('serial', ''),
-            'benchmark':      perf['name'],
-            'dtype':          perf.get('params', {}).get('dtype', ''),
-            'iterations':     perf.get('iterations', ''),
-            'runtime_s':      perf.get('runtime_s', ''),
-            'min':            f"{perf['min']:.4f}",
-            'mean':           f"{perf['mean']:.4f}",
-            'max':            f"{perf['max']:.4f}",
-            'unit':           perf['unit'],
-            'power_avg_w':    f"{tel_s.get('power_W_mean', 0):.1f}" if tel_s.get('power_W_mean') else '',
-            'temp_max_c':     f"{tel_s.get('temp_gpu_C_max', 0):.0f}" if tel_s.get('temp_gpu_C_max') else '',
-        }
-        if args.verbose:
-            row.update({
-                'sm_util_mean':     f"{tel_s['sm_util_mean']:.0f}" if 'sm_util_mean' in tel_s else '',
-                'mem_bw_util_mean': f"{tel_s['mem_bw_util_mean']:.0f}" if 'mem_bw_util_mean' in tel_s else '',
-                'gpu_clock_mean':   f"{tel_s['gpu_clock_mean']:.0f}" if 'gpu_clock_mean' in tel_s else '',
-                'mem_used_gb_mean': f"{tel_s['mem_used_MB_mean'] / 1024:.2f}" if 'mem_used_MB_mean' in tel_s else '',
-                'throttled':        'true' if perf.get('throttled') else 'false',
-            })
-        # In single-GPU mode each process handles its own header;
-        # in multi-GPU mode the parent emits the header before spawning.
-        _emit_compact_csv(row, verbose=args.verbose,
-                          header=(_compact_header_needed and _is_single))
-        _compact_header_needed = False
+        row = _compact_row(perf, tel_data, gpu_index, hostname, args.verbose)
+        if _compact:
+            # In single-GPU mode each process handles its own header;
+            # in multi-GPU mode the parent emits the header before spawning.
+            _emit_compact_csv(row, verbose=args.verbose,
+                              header=(_compact_header_needed and _is_single))
+            _compact_header_needed = False
+        if _csv_output_path:
+            _append_csv_output_row(row, _csv_output_path, args.verbose)
     
     # ── syslog helpers (closure over tel_data, args, gpu_index) ──
     _syslog_enabled = getattr(args, 'syslog', False)
@@ -4316,7 +4504,10 @@ def run_single_gpu(args, gpu_index: int, log=None):
                 log.info(f"   Thermal Throttle: {tel.thermal_throttle_count} samples")
             log.info("="*80)
         tel.shutdown()
-    
+
+    if _owns_csv_output:
+        log.info(f"Compact CSV rows appended to: {_csv_output_path}")
+
     # Emit RUN_END to syslog/dmesg and tear down
     if _syslog_reporter:
         elapsed = time.perf_counter() - _sl_run_start_time
@@ -4422,6 +4613,10 @@ def main():
         sys.exit(0)
     
     log = init_logging(args)
+
+    if args.csv_output and args.csv_output == args.summary_csv:
+        log.warning("--csv-output and --summary-csv point at the same path; "
+                    "the two files differ only by timestamp and may collide")
     
     # Determine which GPUs to run on
     gpu_indices = []
@@ -4494,6 +4689,12 @@ def main():
         if getattr(args, 'compact', False):
             cols = _compact_csv_columns(args.verbose)
             print(",".join(cols), flush=True)
+        
+        # Likewise for --csv-output: the parent creates the file and writes
+        # the header; workers inherit the path via args and append rows.
+        if getattr(args, 'csv_output', None):
+            args._csv_output_path = _start_csv_output(args.csv_output, args.verbose)
+            log.info(f"Compact CSV output: {args._csv_output_path}")
         
         # In syslog mode, emit a parent-level RUN_START framing all GPUs
         # (each worker also emits its own per-GPU RUN_START/RUN_END)
@@ -4759,151 +4960,41 @@ def main():
         log.info("="*80)
         
         if results:
-            # Group benchmarks by position index + name + precision.
-            # Using bench_idx ensures that distinct config entries for the same
-            # benchmark+dtype (e.g., memory_traffic streaming vs random) are
-            # displayed as separate tables instead of being merged.
-            benchmark_groups = {}
-            for result in results:
-                gpu_idx = result['gpu_index']
-                serial = result.get('serial', 'N/A')
-                tel_stats = result.get('telemetry_stats', {})
-                
-                for bench_idx, bench in enumerate(result.get('benchmarks', [])):
-                    if not bench:
-                        continue
-                    # Create unique key using position index to avoid merging
-                    # distinct config entries with the same name+dtype
-                    dtype = bench.get('params', {}).get('dtype', 'unknown')
-                    test_key = f"{bench_idx:03d}_{bench['name']}_{dtype}"
-                    
-                    if test_key not in benchmark_groups:
-                        # Build display name with extra context for benchmarks
-                        # that may appear multiple times with different params
-                        display_name = bench['name']
-                        params = bench.get('params', {})
-                        extra_parts = []
-                        if 'pattern' in params:
-                            extra_parts.append(params['pattern'])
-                        display_label = f"{display_name} ({dtype})" if not extra_parts else f"{display_name} ({dtype}, {', '.join(extra_parts)})"
-                        
-                        benchmark_groups[test_key] = {
-                            'name': bench['name'],
-                            'dtype': dtype,
-                            'unit': bench['unit'],
-                            'display_label': display_label,
-                            'results': []
-                        }
-                    
-                    # Determine status
-                    throttled = tel_stats.get('throttled', False) or bench.get('telemetry', {}).get('throttled', False)
-                    efficiency = bench.get('efficiency_pct', None)
-                    
-                    if throttled:
-                        status = "FAIL"
-                        notes = "Throttled"
-                    elif efficiency is not None and efficiency < args.efficiency_warn_pct:
-                        status = "FAIL"
-                        notes = f"Low efficiency ({efficiency:.0f}%)"
-                    else:
-                        status = "PASS"
-                        notes = ""
-                    
-                    # Use per-benchmark telemetry if available, fallback to overall stats
-                    bench_tel = bench.get('telemetry', {})
-                    benchmark_groups[test_key]['results'].append({
-                        'gpu': gpu_idx,
-                        'serial': serial,
-                        'performance': bench['mean'],
-                        'power_avg': bench_tel.get('power_W_mean', tel_stats.get('power_W_mean', 0)),
-                        'temp_max': bench_tel.get('temp_gpu_C_max', tel_stats.get('temp_gpu_C_max', 0)),
-                        'status': status,
-                        'notes': notes
-                    })
-            
-            # Display each benchmark group as a table
-            csv_data = []  # For optional CSV export
-            
+            benchmark_groups = _group_summary_benchmarks(results, args.efficiency_warn_pct)
             for test_key in sorted(benchmark_groups.keys()):
                 group = benchmark_groups[test_key]
                 results_list = group['results']
-                
-                # Sort by GPU index
-                results_list.sort(key=lambda x: x['gpu'])
-                
-                # Calculate fastest/slowest
-                if len(results_list) > 1:
-                    fastest_perf = max(r['performance'] for r in results_list)
-                    for r in results_list:
-                        if r['performance'] == fastest_perf and not r['notes']:
-                            r['notes'] = "Fastest"
-                
+
                 log.info("")
                 log.info(f"Test: {group['display_label']}")
                 log.info(f"{'GPU':<4} | {'Serial':<12} | {'Performance':<13} | {'Power(avg)':<10} | {'Temp(max)':<9} | {'Status':<6} | Notes")
                 log.info(f"{'-'*4}+{'-'*14}+{'-'*15}+{'-'*12}+{'-'*11}+{'-'*8}+{'-'*20}")
-                
+
                 for r in results_list:
                     perf_str = f"{r['performance']:.1f} {group['unit']}"
                     power_str = f"{r['power_avg']:.0f}W" if r['power_avg'] > 0 else "N/A"
                     temp_str = f"{r['temp_max']:.0f}C" if r['temp_max'] > 0 else "N/A"
-                    
+
                     log.info(f"{r['gpu']:<4} | {r['serial']:<12} | {perf_str:<13} | {power_str:<10} | {temp_str:<9} | {r['status']:<6} | {r['notes']}")
-                    
-                    # Collect for CSV export
-                    csv_data.append({
-                        'test': group['name'],
-                        'dtype': group['dtype'],
-                        'gpu': r['gpu'],
-                        'serial': r['serial'],
-                        'performance': r['performance'],
-                        'unit': group['unit'],
-                        'power_avg_W': r['power_avg'],
-                        'temp_max_C': r['temp_max'],
-                        'status': r['status'],
-                        'notes': r['notes']
-                    })
-                
+
                 # Aggregate stats if multi-GPU
                 unique_gpus = len(set(r['gpu'] for r in results_list))
                 if unique_gpus > 1:
                     values = [r['performance'] for r in results_list]
                     aggregate = sum(values)
                     cv = (statistics.stdev(values) / statistics.mean(values) * 100.0) if len(values) > 1 else 0.0
-                    log.info(f"")
+                    log.info("")
                     log.info(f"Aggregate: {aggregate:.1f} {group['unit']} across {unique_gpus} GPUs | Variation: CV={cv:.1f}%")
-            
-            # Optional CSV export
-            if hasattr(args, 'summary_csv') and args.summary_csv and csv_data:
-                try:
-                    import csv
-                    import socket
-                    from datetime import datetime
-                    from pathlib import Path
-                    
-                    # Make filename unique per node to avoid conflicts at scale
-                    hostname = socket.gethostname().split('.', 1)[0]
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    
-                    csv_path = args.summary_csv
-                    # Insert hostname_timestamp before extension
-                    path_obj = Path(csv_path)
-                    unique_filename = f"{path_obj.stem}_{hostname}_{timestamp}{path_obj.suffix}"
-                    csv_path = path_obj.parent / unique_filename
-                    
-                    with open(csv_path, 'w', newline='') as csvfile:
-                        fieldnames = ['test', 'dtype', 'gpu', 'serial', 'performance', 'unit', 'power_avg_W', 'temp_max_C', 'status', 'notes']
-                        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                        writer.writeheader()
-                        writer.writerows(csv_data)
-                    log.info(f"")
-                    log.info(f"Summary exported to CSV: {csv_path}")
-                except Exception as e:
-                    log.warning(f"Failed to export CSV summary: {e}")
         
         log.info("")
         log.info("="*80)
     
+    # Export the summary CSV on single- and multi-GPU runs alike
+    if args.summary_csv and results:
+        summary_rows = _build_summary_rows(results, args.efficiency_warn_pct)
+        if summary_rows:
+            _write_summary_csv(summary_rows, args.summary_csv, log)
+
     # Export JSON if requested
     if args.json_output and results:
         export_json_results(results, args, log)
@@ -4914,17 +5005,9 @@ def export_json_results(results, args, log):
     import json
     import socket
     from datetime import datetime
-    from pathlib import Path
     
-    # Make filename unique per node to avoid conflicts at scale
     hostname = socket.gethostname().split('.', 1)[0]
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    output_path = args.json_output
-    # Insert hostname_timestamp before extension
-    path_obj = Path(output_path)
-    unique_filename = f"{path_obj.stem}_{hostname}_{timestamp}{path_obj.suffix}"
-    output_path = path_obj.parent / unique_filename
+    output_path = _unique_output_path(args.json_output)
     
     try:
         # Build comprehensive JSON structure
