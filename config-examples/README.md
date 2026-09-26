@@ -63,6 +63,7 @@ global:
   cpu_affinity: false     # Boolean flags accept true or false
   stress_test: true       # Auto-size benchmarks to fill available memory
   duration: 60            # Run each benchmark for 60s (also accepted under runtime:)
+  csv_output: results.csv # Compact CSV to a file (stdout unchanged); <hostname>_<timestamp> is inserted
 
 runtime:
   temp_warn_C: 85.0       # Temperature warning threshold

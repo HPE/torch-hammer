@@ -3236,3 +3236,84 @@ class TestReadinessFixes:
         doc = hr.detect_outliers.__doc__
         assert doc is not None
         assert "sigma" in doc.lower()
+
+
+# ---------------------------------------------------------------------------
+# --csv-output / --summary-csv files written by torch-hammer round-trip
+# ---------------------------------------------------------------------------
+
+class TestCsvOutputRoundTrip:
+    """Files produced by torch-hammer's CSV writers load through _detect_and_load."""
+
+    def _perf(self):
+        return {
+            "name": "Batched GEMM", "params": {"dtype": "float32"},
+            "iterations": 10, "runtime_s": 1.5,
+            "min": 48000.0, "mean": 49500.0, "max": 50700.0,
+            "unit": "GFLOP/s",
+            "telemetry": {
+                "power_W_mean": 620.0, "temp_gpu_C_max": 71.0,
+                "sm_util_mean": 98.0, "mem_bw_util_mean": 40.0,
+                "gpu_clock_mean": 1980.0, "mem_used_MB_mean": 20480.0,
+            },
+            "throttled": True,
+        }
+
+    def _result(self):
+        return {
+            "gpu_index": 0, "serial": "S1",
+            "telemetry_stats": {"power_W_mean": 300.0, "temp_gpu_C_max": 70.0},
+            "benchmarks": [{
+                "name": "Batched GEMM", "unit": "GFLOP/s",
+                "mean": 100.0, "min": 90.0, "max": 110.0,
+                "params": {"dtype": "float32"}, "telemetry": {},
+            }],
+        }
+
+    def test_csv_output_round_trips_through_hammer_report(self, th, tmp_path):
+        tel = {"model": "NVIDIA Example GPU", "serial": "SER123"}
+        row = th._compact_row(self._perf(), tel, gpu_index=2,
+                              hostname="node01", verbose=True)
+        path = tmp_path / "out.csv"
+        with path.open("w", newline="") as fh:
+            th._emit_compact_csv(row, verbose=True, header=True, file=fh)
+
+        results = hr._detect_and_load(path)
+        assert len(results) == 1
+        r = results[0]
+        # Routed to the compact loader, not the summary loader
+        assert r.gpu_model == "NVIDIA Example GPU"
+        assert r.min_val != r.mean_val
+        assert r.hostname == "node01"
+        assert r.gpu == 2
+        assert r.serial == "SER123"
+        assert r.benchmark == "Batched GEMM"
+        assert r.dtype == "float32"
+        assert r.iterations == 10
+        assert abs(r.min_val - 48000.0) < 1e-3
+        assert abs(r.mean_val - 49500.0) < 1e-3
+        assert abs(r.max_val - 50700.0) < 1e-3
+        assert r.unit == "GFLOP/s"
+        assert r.power_avg_w == 620.0
+        assert r.temp_max_c == 71.0
+        assert r.sm_util_mean == 98.0
+        assert r.throttled is True
+
+    def test_summary_csv_round_trips_through_hammer_report(self, th, tmp_path):
+        from unittest.mock import MagicMock
+        rows = th._build_summary_rows([self._result()], 70.0)
+        written = th._write_summary_csv(rows, str(tmp_path / "s.csv"), MagicMock())
+        assert written is not None and written.exists()
+
+        results = hr._detect_and_load(written)
+        assert len(results) == 1
+        r = results[0]
+        # Routed to the summary loader: no model, single performance value
+        assert r.gpu_model == ""
+        assert r.min_val == r.mean_val == r.max_val == 100.0
+        assert r.benchmark == "Batched GEMM"
+        assert r.dtype == "float32"
+        assert r.gpu == 0
+        assert r.serial == "S1"
+        assert r.power_avg_w == 300.0
+        assert r.temp_max_c == 70.0
