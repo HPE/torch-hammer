@@ -17,6 +17,8 @@ Covers:
 import csv
 import io
 import json
+import re
+import statistics
 import sys
 from collections import OrderedDict
 from pathlib import Path
@@ -789,17 +791,15 @@ class TestScaleAdaptive:
         results = _make_results(n_nodes=100, n_gpus=2)
         stats = hr.compute_benchmark_stats(results)
         html_out = hr.render_html(results, stats, [], "test.csv", 15.0)
-        assert "p5:" in html_out
+        assert "p5/p95:" in html_out
         assert "median:" in html_out
-        assert "p95:" in html_out
 
     def test_small_fleet_with_10_gpus_shows_percentiles(self):
         """>=10 GPUs should show percentile stats regardless of node count."""
         results = _make_results(n_nodes=5, n_gpus=2)  # 10 GPUs
         stats = hr.compute_benchmark_stats(results)
         html_out = hr.render_html(results, stats, [], "test.csv", 15.0)
-        assert "p5:" in html_out
-        assert "p95:" in html_out
+        assert "p5/p95:" in html_out
 
     def test_scale_threshold_constant(self):
         assert hr.SCALE_THRESHOLD == 50
@@ -1001,7 +1001,7 @@ class TestMultiMetricCharts:
         results = _make_results(n_nodes=5, n_gpus=2, power=250.0, temp=72.0)
         stats = hr.compute_benchmark_stats(results)
         html_out = hr.render_html(results, stats, [], "test.csv", 15.0)
-        assert "Power (W)" in html_out
+        assert "GPU mean power (W)" in html_out
         assert "chart-secondary" in html_out
 
     def test_small_fleet_temp_panel(self):
@@ -1009,7 +1009,7 @@ class TestMultiMetricCharts:
         results = _make_results(n_nodes=5, n_gpus=2, power=250.0, temp=72.0)
         stats = hr.compute_benchmark_stats(results)
         html_out = hr.render_html(results, stats, [], "test.csv", 15.0)
-        assert "Temperature" in html_out
+        assert "GPU max temperature" in html_out
 
     def test_small_fleet_no_power_no_panel(self):
         """No power data => no power chart panel."""
@@ -1017,15 +1017,15 @@ class TestMultiMetricCharts:
         stats = hr.compute_benchmark_stats(results)
         html_out = hr.render_html(results, stats, [], "test.csv", 15.0)
         # The chart-secondary div should not appear in the body (only in CSS)
-        assert "Power (W)" not in html_out
-        assert "Temperature" not in html_out
+        assert "GPU mean power (W)" not in html_out
+        assert "temperature" not in html_out
 
     def test_large_fleet_power_histogram(self):
         """Large fleet with power data should show power histogram."""
         results = _make_results(n_nodes=100, n_gpus=1, power=250.0, temp=72.0)
         stats = hr.compute_benchmark_stats(results)
         html_out = hr.render_html(results, stats, [], "test.csv", 15.0)
-        assert "Power (W)" in html_out
+        assert "GPU mean power (W)" in html_out
         assert "chart-row" in html_out
 
     def test_large_fleet_multi_panel_layout(self):
@@ -1185,7 +1185,8 @@ class TestSVGSizes:
     def test_viewbox_dimensions(self):
         assert hr._SVG_W == 960
         assert hr._SVG_H == 320
-        assert hr._SVG_H_SM == 260
+        assert hr._SVG_H_STRIP == 260
+        assert (hr._SVG_W_SM, hr._SVG_H_SM) == (360, 220)  # #37 small multiples
 
     def test_bar_chart_uses_new_viewbox(self):
         results = _make_results(n_nodes=3, n_gpus=1)
@@ -1206,33 +1207,33 @@ class TestTelemetryMetrics:
         results = _make_results(n_nodes=5, n_gpus=2, sm_util=85.0)
         stats = hr.compute_benchmark_stats(results)
         html_out = hr.render_html(results, stats, [], "test.csv", 15.0)
-        assert "SM Utilization (%)" in html_out
+        assert "GPU mean SM utilization (%)" in html_out
 
     def test_small_fleet_mem_bw_panel(self):
         results = _make_results(n_nodes=5, n_gpus=2, mem_bw_util=60.0)
         stats = hr.compute_benchmark_stats(results)
         html_out = hr.render_html(results, stats, [], "test.csv", 15.0)
-        assert "Memory BW Utilization (%)" in html_out
+        assert "GPU mean memory BW utilization (%)" in html_out
 
     def test_small_fleet_gpu_clock_panel(self):
         results = _make_results(n_nodes=5, n_gpus=2, gpu_clock=1500.0)
         stats = hr.compute_benchmark_stats(results)
         html_out = hr.render_html(results, stats, [], "test.csv", 15.0)
-        assert "GPU Clock (MHz)" in html_out
+        assert "GPU mean GPU clock (MHz)" in html_out
 
     def test_no_telemetry_no_panels(self):
         results = _make_results(n_nodes=5, n_gpus=2, sm_util=0.0, mem_bw_util=0.0, gpu_clock=0.0)
         stats = hr.compute_benchmark_stats(results)
         html_out = hr.render_html(results, stats, [], "test.csv", 15.0)
-        assert "SM Utilization" not in html_out
-        assert "Memory BW" not in html_out
-        assert "GPU Clock" not in html_out
+        assert "SM utilization" not in html_out
+        assert "memory BW" not in html_out
+        assert "GPU clock" not in html_out
 
     def test_large_fleet_sm_util_histogram(self):
         results = _make_results(n_nodes=100, n_gpus=1, sm_util=90.0)
         stats = hr.compute_benchmark_stats(results)
         html_out = hr.render_html(results, stats, [], "test.csv", 15.0)
-        assert "SM Utilization (%)" in html_out
+        assert "GPU mean SM utilization (%)" in html_out
         assert "chart-panel" in html_out
 
     def test_benchmark_stats_collects_new_fields(self):
@@ -1680,12 +1681,12 @@ class TestTufteDesignFixes:
         assert "grid-template-columns" in html_out
 
     def test_html_has_fleet_mean_line(self):
-        """Full HTML render should contain fleet mean marker (ø symbol)."""
+        """Full HTML render should contain the fleet mean marker label."""
         results = _make_results(n_nodes=5, n_gpus=2)
         stats = hr.compute_benchmark_stats(results)
         html_out = hr.render_html(results, stats, [], "test.csv", 15.0)
-        # Histogram uses ø (\u00f8) for fleet mean marker
-        assert '\u00f8' in html_out
+        # Histogram labels the fleet mean line with the word 'mean' (T3)
+        assert '>mean</text>' in html_out
 
 
 # ======================================================================
@@ -1745,7 +1746,7 @@ class TestHistogramAlways:
         results = _make_results(n_nodes=5, n_gpus=2)  # 10 GPUs
         stats = hr.compute_benchmark_stats(results)
         html_out = hr.render_html(results, stats, [], "test.csv", 15.0)
-        assert "p5:" in html_out
+        assert "p5/p95:" in html_out
 
 
 # ======================================================================
@@ -1818,7 +1819,7 @@ class TestDotPlot:
     def test_dot_plot_fleet_mean_marker(self):
         vals = [100 + i for i in range(30)]
         svg = hr._svg_dot_plot(vals, "GFLOP/s", 115.0, n_bins=15)
-        assert '\u00f8' in svg
+        assert '>mean</text>' in svg
 
     def test_dot_plot_adaptive_tick_width(self):
         """Tick width adapts to fleet size: thinner for larger fleets."""
@@ -2476,7 +2477,7 @@ class TestInteractiveMode:
                         results, stats, [], source_name="t.csv", threshold=15.0)
             assert "Iteration Trace" in html_out
             assert "p10" in html_out
-            assert "fleet median" in html_out
+            assert "fleet median across GPUs" in html_out
         finally:
             hr._iteration_data.clear()
             hr._iteration_data.update(old_data)
@@ -2516,8 +2517,8 @@ class TestInteractiveMode:
                 with patch.object(hr, '_plotly_offline', mock_plotly):
                     html_out = hr._render_interactive_html(
                         results, stats, [], source_name="t.csv", threshold=15.0)
-            # Enhanced inventory has vs Fleet and Status columns
-            assert "vs Fleet" in html_out
+            # Enhanced inventory has 'vs fleet mean' and Status columns
+            assert "vs fleet mean" in html_out
             assert "Status" in html_out
             # Status icons in JS
             assert "\\u2714" in html_out  # checkmark
@@ -3317,3 +3318,417 @@ class TestCsvOutputRoundTrip:
         assert r.serial == "S1"
         assert r.power_avg_w == 300.0
         assert r.temp_max_c == 70.0
+
+
+# ======================================================================
+# 29. Report cluster (#32 vocabulary, #31 sort rule, #33 zero vs missing,
+#     #37 small multiples) -- see design/report-cluster.md T1-T30
+# ======================================================================
+
+_MOCK_PLOTLY_JS = "/* plotly.js bundle mock */"
+
+
+def _render_interactive(results, stats, outliers=None, iteration_data=None):
+    """Render the interactive report with the Plotly bundle mocked out.
+
+    Mocking the bundle means every <script> block left in the output is
+    OUR JavaScript, so tests can scan the whole document for label text.
+    """
+    from unittest.mock import MagicMock
+    saved = dict(hr._iteration_data)
+    try:
+        hr._iteration_data.clear()
+        if iteration_data:
+            hr._iteration_data.update(iteration_data)
+        with patch.object(hr, "_PLOTLY_AVAILABLE", True):
+            mock_plotly = MagicMock()
+            mock_plotly.get_plotlyjs.return_value = _MOCK_PLOTLY_JS
+            with patch.object(hr, "_plotly_offline", mock_plotly):
+                return hr._render_interactive_html(
+                    results, stats, outliers or [],
+                    source_name="test.csv", threshold=15.0)
+    finally:
+        hr._iteration_data.clear()
+        hr._iteration_data.update(saved)
+
+
+_SCRIPT_BLOCK_RE = re.compile(r"<script\b[^>]*>.*?</script>", re.DOTALL)
+
+
+def _strip_scripts(html_text):
+    return _SCRIPT_BLOCK_RE.sub("", html_text)
+
+
+class TestVocabulary:
+    """#32 (T1-T12): statistics are named 'mean' or 'median' only."""
+
+    BANNED = [re.compile(p, re.IGNORECASE)
+              for p in (r"\bavg\b", r"\baverage\b", r"\bmu\b", "\u03bc", "\u00f8")]
+
+    def _offending(self, text):
+        return sorted({m.group(0) for rx in self.BANNED for m in rx.finditer(text)})
+
+    def test_no_banned_statistic_words(self):
+        results = _make_results(n_nodes=12, n_gpus=2, power=250.0, temp=72.0,
+                                sm_util=85.0, mem_bw_util=60.0, gpu_clock=1500.0)
+        stats = hr.compute_benchmark_stats(results)
+        outliers = hr.detect_outliers(stats, threshold_pct=15.0)
+
+        static_html = hr.render_html(results, stats, outliers, "test.csv", 15.0)
+        assert self._offending(_strip_scripts(static_html)) == []
+
+        # Interactive: the bundle is mocked, so the remaining JS is ours and
+        # its label strings, hover templates and axis titles are all scanned.
+        interactive_html = _render_interactive(results, stats, outliers)
+        assert _MOCK_PLOTLY_JS in interactive_html
+        assert self._offending(interactive_html.replace(_MOCK_PLOTLY_JS, "")) == []
+
+        cli_out = io.StringIO()
+        with patch.object(sys, "stderr", cli_out):
+            hr.print_summary(results, stats, outliers, 15.0)
+        assert self._offending(cli_out.getvalue()) == []
+
+    def test_static_stats_line_names_statistics(self):
+        """T1: median precedes p5/p95; power is 'mean power'."""
+        results = _make_results(n_nodes=5, n_gpus=2, power=250.0, temp=72.0)
+        stats = hr.compute_benchmark_stats(results)
+        html_out = hr.render_html(results, stats, [], "test.csv", 15.0)
+        stats_line = re.search(r'class="stats-line">([^<]*)<', html_out).group(1)
+        assert "fleet mean:" in stats_line
+        assert "mean power:" in stats_line
+        assert "max temp:" in stats_line
+        assert stats_line.index("median:") < stats_line.index("p5/p95:")
+
+    def test_static_table_header_is_node_mean(self):
+        """T2."""
+        results = _make_results(n_nodes=3, n_gpus=2)
+        stats = hr.compute_benchmark_stats(results)
+        html_out = hr.render_html(results, stats, [], "test.csv", 15.0)
+        assert ">node mean</th>" in html_out
+
+    def test_static_subtitles_name_statistic_and_population(self):
+        """T4: every panel says which per-GPU statistic it distributes.
+
+        Temperature is the per-GPU run *max* (GPUResult.temp_max_c), so its
+        subtitle must say 'max', not 'mean' -- a mislabelled statistic is the
+        very defect this issue exists to remove.
+        """
+        results = _make_results(n_nodes=5, n_gpus=2, power=250.0, temp=72.0,
+                                sm_util=85.0, mem_bw_util=60.0, gpu_clock=1500.0)
+        stats = hr.compute_benchmark_stats(results)
+        html_out = hr.render_html(results, stats, [], "test.csv", 15.0)
+        for expected in (
+            "Fleet distribution of GPU mean performance (GFLOP/s)",
+            "Fleet distribution of GPU mean power (W)",
+            "Fleet distribution of GPU max temperature (\u00b0C)",
+            "Fleet distribution of GPU mean SM utilization (%)",
+            "Fleet distribution of GPU mean memory BW utilization (%)",
+            "Fleet distribution of GPU mean GPU clock (MHz)",
+        ):
+            assert expected in html_out, expected
+
+    def test_static_mean_marker_is_a_word_not_a_glyph(self):
+        """T3: the fleet-mean marker on histogram and dot plot reads 'mean'."""
+        vals = [100.0 + i for i in range(30)]
+        for svg in (hr._svg_histogram(vals, "GFLOP/s", 114.5, n_bins=10),
+                    hr._svg_dot_plot(vals, "GFLOP/s", 114.5, n_bins=10)):
+            assert ">mean</text>" in svg
+            assert "\u00f8" not in svg
+
+    def test_interactive_labels_name_statistic_and_population(self):
+        """T5-T11 label strings in our JS/HTML."""
+        results = _make_results(n_nodes=3, n_gpus=2, power=250.0, temp=72.0)
+        stats = hr.compute_benchmark_stats(results)
+        html_out = _render_interactive(results, stats)
+        for expected in (
+            "Each square uses the node mean of the selected metric.",      # T5
+            "Distribution of GPU mean of the selected metric",             # T5
+            '"mean = "',                                                   # T6
+            '"\\u03c3 = "',                                                # T6 sigma kept
+            '"mean power"',                                                # T7
+            '"Mean power (W)"',                                            # T7
+            '"fleet mean: "',                                              # T8
+            '"Node, ascending node mean ("',                               # T8
+            '"fleet median across GPUs"',                                  # T9
+            "fleet median: %{y:.1f}",                                      # T9
+            ' GPU median (',                                               # T9 bands
+            'mean "+mLabel+" per iteration"',                              # T10
+            "Cells show the measured (or downsampled mean) value",         # T10
+            "Latest iteration \"+mLabel+\": %{y:.1f}",                     # T10
+            'text:"latest iteration "+mLabel',                             # T10
+            '"vs fleet mean"',                                             # T11
+            '"GPU "+metricStatistic(metric)+" "+metricNoun(metric)',       # T11
+        ):
+            assert expected in html_out, expected
+
+    def test_readme_mirrors_shipped_labels(self):
+        """T12."""
+        readme = (ROOT_DIR / "reports" / "README.md").read_text()
+        assert "mean power" in readme
+        assert "node mean" in readme
+        assert not re.search(r"\bavg\b", readme, re.IGNORECASE)
+
+
+_HAMMER_SRC = (ROOT_DIR / "reports" / "hammer_report.py").read_text()
+
+
+class TestAscendingSortRule:
+    """#31 (T13-T18): value-ordered views sort ascending, colour carries good/bad.
+
+    The comparators live in embedded JavaScript, so these are source-level
+    checks: one shared comparator, no direction-flipping ternaries left.
+    """
+
+    def test_single_ascending_comparator_is_defined_once_and_reused(self):
+        assert _HAMMER_SRC.count("function ascByMean(") == 1
+        # T15 (x2 flat-grid fallbacks), T16 strip, T17 GPU columns, T18 node columns
+        assert _HAMMER_SRC.count("ascByMean(") - 1 >= 5
+
+    def test_no_direction_flipping_sort_comparators_remain(self):
+        for legacy in (
+            "lowerBetter?va-vb:vb-va",                 # T15 fleet map fallbacks
+            "lowerBetter?nodeMeans[a]-nodeMeans[b]",   # T16 node variability
+            "lb?a.mean-b.mean:b.mean-a.mean",          # T17 waterfall GPU sort
+            "lb2?ma-mb:mb-ma",                         # T18 waterfall node sort
+        ):
+            assert legacy not in _HAMMER_SRC, legacy
+
+    def test_is_lower_better_kept_for_outlier_direction(self):
+        """T14: isLowerBetter still exists; it drives legends/outliers, not order."""
+        assert "function isLowerBetter(" in _HAMMER_SRC
+
+    def test_waterfall_sort_option_is_named_by_value_ascending(self):
+        """T17."""
+        results = _make_results(n_nodes=2, n_gpus=2)
+        stats = hr.compute_benchmark_stats(results)
+        html_out = _render_interactive(results, stats)
+        assert '<option value="performance">By value (ascending)</option>' in html_out
+        assert "By Performance" not in html_out
+
+    def test_readme_describes_ascending_node_mean(self):
+        readme = (ROOT_DIR / "reports" / "README.md").read_text()
+        assert "ascending node mean" in readme
+        assert "sorted by mean performance" not in readme
+
+
+def _json_fixture_with_iteration_telemetry(samples):
+    """One GPU, one benchmark; `samples` is a list of telemetry dicts."""
+    iteration_telemetry = [
+        {"iteration": i, "performance": 1000.0 + i, "telemetry": tel}
+        for i, tel in enumerate(samples)
+    ]
+    return {
+        "metadata": {"hostname": "testnode"},
+        "gpus": [{
+            "gpu_index": 0, "model": "TestGPU", "serial": "SN0000",
+            "benchmarks": [{
+                "name": "Batched GEMM", "params": {"dtype": "float32"},
+                "iterations": len(samples), "runtime_s": 1.0,
+                "min": 1000.0, "mean": 1000.5, "max": 1001.0, "unit": "GFLOP/s",
+                "telemetry": {}, "iteration_telemetry": iteration_telemetry,
+            }],
+        }],
+    }
+
+
+def _load_iteration_records(loader, path):
+    saved = dict(hr._iteration_data)
+    try:
+        hr._iteration_data.clear()
+        loader(path)
+        assert len(hr._iteration_data) == 1
+        return next(iter(hr._iteration_data.values()))
+    finally:
+        hr._iteration_data.clear()
+        hr._iteration_data.update(saved)
+
+
+def _decode_iteration_block(html_out):
+    import base64
+    import gzip
+    m = re.search(r'<script id="iter-data-gz"[^>]*>([^<]*)</script>', html_out)
+    assert m, "gzip'd iteration block missing"
+    return gzip.decompress(base64.b64decode(m.group(1))).decode("utf-8")
+
+
+class TestZeroVsMissing:
+    """#33 (T19-T22): missing telemetry is None/null, a measured zero is 0."""
+
+    # -- Python loader contract (T19) ---------------------------------------
+
+    @pytest.mark.parametrize("raw", [None, "", "N/A", "n/a", "abc", float("nan")])
+    def test_opt_float_returns_none_for_missing(self, raw):
+        assert hr._opt_float(raw) is None
+
+    @pytest.mark.parametrize("raw,expected", [(0, 0.0), ("0", 0.0), (12, 12.0), ("3.5", 3.5)])
+    def test_opt_float_keeps_measured_values(self, raw, expected):
+        value = hr._opt_float(raw)
+        assert value == expected
+        assert isinstance(value, float)
+
+    def test_load_json_missing_telemetry_is_none(self, tmp_path):
+        fixture = _json_fixture_with_iteration_telemetry([
+            {"power_W": 250.0, "sm_util": 90},                         # no mem_bw_util
+            {"power_W": 251.0, "sm_util": 91, "mem_bw_util": 0},       # measured zero
+            {"power_W": "N/A", "sm_util": 92, "mem_bw_util": 40},      # N/A string
+        ])
+        path = tmp_path / "results.json"
+        path.write_text(json.dumps(fixture))
+        records = _load_iteration_records(hr.load_json, path)
+        assert records[0]["mem_bw_util"] is None
+        assert records[1]["mem_bw_util"] == 0.0
+        assert records[2]["power_W"] is None
+        assert records[0]["temp_gpu_C"] is None and records[0]["gpu_clock"] is None
+        # performance never missing, throttled stays an int
+        assert records[0]["performance"] == 1000.0
+        assert records[0]["throttled"] == 0
+
+    def test_load_verbose_log_missing_telemetry_is_none(self, tmp_path):
+        log_text = (
+            "2026-01-01T00:00:00 INFO repeat, iter, test, dtype, gflops, "
+            "power_W, temp_gpu_C, sm_util, mem_bw_util\n"                # no gpu_clock column
+            "2026-01-01T00:00:01 INFO 0, 0, gemm, float32, 1000.0, 250.0, 72, 90, 0\n"
+            "2026-01-01T00:00:02 INFO 0, 1, gemm, float32, 1010.0, N/A, 73, 91, 50\n"
+        )
+        path = tmp_path / "gpu0_testnode_SN123456789012.csv"
+        path.write_text(log_text)
+        records = _load_iteration_records(hr.load_verbose_log, path)
+        assert records[0]["gpu_clock"] is None
+        assert records[0]["mem_bw_util"] == 0.0
+        assert records[1]["power_W"] is None
+        assert records[1]["mem_bw_util"] == 50.0
+
+    def test_safe_json_serialises_none_as_null(self):
+        assert hr._safe_json({"mem_bw_util": None, "sm_util": 0.0}) == \
+            '{"mem_bw_util": null, "sm_util": 0.0}'
+        assert hr._safe_json("</script>") == '"<\\/script>"'
+
+    def test_interactive_iteration_block_carries_null(self):
+        results = _make_results(n_nodes=1, n_gpus=1)
+        stats = hr.compute_benchmark_stats(results)
+        key = "{}:0:Batched GEMM:float32".format(results[0].hostname)
+        iteration_data = {key: [
+            {"iteration": 0, "performance": 1000.0, "power_W": 250.0, "temp_gpu_C": 70.0,
+             "sm_util": 90.0, "mem_bw_util": None, "gpu_clock": 1500.0, "throttled": 0},
+        ]}
+        html_out = _render_interactive(results, stats, iteration_data=iteration_data)
+        decoded = json.loads(_decode_iteration_block(html_out))
+        assert decoded[key][0]["mem_bw_util"] is None
+
+    # -- JavaScript contract (T19-T22), checked at source level -------------
+
+    def test_js_never_uses_zero_as_missing_sentinel(self):
+        """T19: filters are `v!=null`, never `v>0`, for per-iteration telemetry."""
+        assert _HAMMER_SRC.count("v!=null&&v>0") == 0
+        assert _HAMMER_SRC.count("v==null||v<=0") == 0
+        assert "latestVal>0" not in _HAMMER_SRC
+
+    def test_js_waterfall_gaps_have_no_hover_and_break_the_spectrum(self):
+        """T20 heatmap gaps; T22 spectrum breaks where no latest sample exists."""
+        assert "hoverongaps:false" in _HAMMER_SRC
+        assert "connectgaps:false" in _HAMMER_SRC
+        assert "hasLatest" in _HAMMER_SRC
+
+    def test_js_waterfall_colour_domain_is_metric_specific(self):
+        """T21: utilisation bounded 0-100, other metrics on p2-p98 of non-null cells."""
+        assert "zmin:zRange[0],zmax:zRange[1]" in _HAMMER_SRC
+        assert "BOUNDED_PERCENT_METRICS={sm_util:true,mem_bw_util:true}" in _HAMMER_SRC
+        assert "return [0,100]" in _HAMMER_SRC
+        assert "quantile(sorted,0.02)" in _HAMMER_SRC
+        assert "quantile(sorted,0.98)" in _HAMMER_SRC
+
+
+_VIEWBOX_RE = re.compile(r'viewBox="0 0 (\d+) (\d+)"')
+_FONT_SIZE_RE = re.compile(r'font-size="(\d+(?:\.\d+)?)"')
+
+
+def _svg_viewboxes(html_out):
+    return [(int(w), int(h)) for w, h in _VIEWBOX_RE.findall(html_out)]
+
+
+class TestSmallMultiples:
+    """#37 (T23-T26): secondary panels are compact small multiples.
+
+    A 960-unit viewBox squeezed into a ~350 px grid cell scales text to
+    ~4 px. Compact charts use a 360-unit viewBox so one unit is ~1 px and
+    no label drops below 11 px (T23); the main performance chart is unchanged.
+    """
+
+    def test_svg_open_dims(self):
+        assert 'viewBox="0 0 360 220"' in hr._svg_open(360, 220)
+        assert 'viewBox="0 0 960 320"' in hr._svg_open(960, 320)
+
+    def test_compact_constants(self):
+        assert hr._SVG_W_SM == 360
+        assert 0.55 <= hr._SVG_H_SM / hr._SVG_W_SM <= 0.7  # T24: h ~ 0.62 w
+
+    @pytest.mark.parametrize("dot_plot", [False, True])
+    def test_secondary_svgs_use_compact_viewbox(self, dot_plot):
+        results = _make_results(n_nodes=4, n_gpus=2, power=250.0, temp=70.0,
+                                sm_util=90.0, mem_bw_util=50.0, gpu_clock=1500.0)
+        stats = hr.compute_benchmark_stats(results)
+        html_out = hr.render_html(results, stats, [], "test.csv", 15.0,
+                                  dot_plot=dot_plot)
+        boxes = _svg_viewboxes(html_out)
+        assert len(boxes) >= 3, boxes
+        assert boxes[0] == (hr._SVG_W, hr._SVG_H), "performance chart unchanged (T26)"
+        assert all(b == (hr._SVG_W_SM, hr._SVG_H_SM) for b in boxes[1:]), boxes
+
+    @pytest.mark.parametrize("renderer", ["_svg_histogram", "_svg_dot_plot"])
+    def test_compact_svg_has_fewer_ticks(self, renderer):
+        vals = [1000.0 + (i * 37) % 250 for i in range(120)]
+        vals[0] = 400.0  # a >3 sigma outlier that the full chart would label
+        results = _make_results(n_nodes=15, n_gpus=8)
+        fn = getattr(hr, renderer)
+        kwargs = {"results": results} if renderer == "_svg_dot_plot" else {}
+        full = fn(vals, "W", statistics.mean(vals), n_bins=20, threshold_pct=15.0, **kwargs)
+        compact = fn(vals, "W", statistics.mean(vals), n_bins=20, threshold_pct=15.0,
+                     compact=True, **kwargs)
+        assert compact.count("<text") <= full.count("<text")
+        assert compact.count("<text") < full.count("<text")
+
+    @pytest.mark.parametrize("renderer", ["_svg_histogram", "_svg_dot_plot"])
+    def test_compact_svg_text_is_legible(self, renderer):
+        """T23: nothing below 11 units in a compact chart (1 unit ~ 1 px)."""
+        vals = [1000.0 + (i * 37) % 250 for i in range(120)]
+        vals[0] = 400.0
+        results = _make_results(n_nodes=15, n_gpus=8)
+        fn = getattr(hr, renderer)
+        kwargs = {"results": results} if renderer == "_svg_dot_plot" else {}
+        compact = fn(vals, "W", statistics.mean(vals), n_bins=20, threshold_pct=15.0,
+                     compact=True, **kwargs)
+        sizes = [float(s) for s in _FONT_SIZE_RE.findall(compact)]
+        assert sizes and min(sizes) >= 11, sorted(set(sizes))
+        # T25: no per-point labels, no legend
+        assert "within 1" not in compact
+        assert ">node0:0<" not in compact
+
+    def test_compact_svg_x_labels_are_capped(self):
+        """T25: at most 8 x tick labels in a compact histogram."""
+        vals = [1000.0 + i for i in range(200)]
+        compact = hr._svg_histogram(vals, "W", 1100.0, n_bins=40, compact=True)
+        g = hr._chart_geometry(compact=True)
+        axis_row = 'y="{}"'.format(g.h - g.mb + 16)
+        x_labels = [t for t in re.findall(r"<text [^>]*>", compact) if axis_row in t]
+        assert 1 <= len(x_labels) <= 8, len(x_labels)
+        full = hr._svg_histogram(vals, "W", 1100.0, n_bins=40)
+        assert len(x_labels) < full.count("<text")
+
+    def test_full_charts_are_unchanged(self):
+        """T26: default (non-compact) rendering keeps the 960-wide viewBox and margins."""
+        vals = [1000.0 + i for i in range(50)]
+        for fn in (hr._svg_histogram, hr._svg_dot_plot):
+            svg = fn(vals, "W", 1025.0)
+            assert 'viewBox="0 0 960 320"' in svg
+        assert hr._ML == 72 and hr._MR == 24 and hr._MT == 24 and hr._MB == 60
+
+    def test_bar_renderers_accept_compact(self):
+        results = _make_results(n_nodes=12, n_gpus=2)
+        by_node = hr._group_by(results, lambda r: r.hostname)
+        nodes = sorted(by_node.keys())
+        bar = hr._svg_bar_chart(nodes, [0, 1], by_node, "GFLOP/s", 900, 1100, compact=True)
+        assert 'viewBox="0 0 360 220"' in bar
+        assert "GPU 0</text>" not in bar  # T25: no legend in compact
+        single = hr._svg_single_bar(nodes, {n: 250.0 for n in nodes}, "W", "#E69F00",
+                                    compact=True)
+        assert 'viewBox="0 0 360 220"' in single
