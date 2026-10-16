@@ -113,7 +113,7 @@ if "OMP_NUM_THREADS" not in os.environ:
     os.environ["OMP_PLACES"] = "cores"
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 import multiprocessing
 import threading
 
@@ -908,6 +908,7 @@ class RocmTelemetry(TelemetryBase):
             # AMD throttle detection (from metrics dict we already fetched)
             # throttle_status is a bitmask - decode different throttle reasons
             throttled = 0
+            thermal_slowdown = 0  # Per-sample thermal flag (melt mode ignores power-cap throttling)
             throttle_reason = ""
             try:
                 throttle_status = metrics.get('throttle_status', 0)
@@ -924,6 +925,7 @@ class RocmTelemetry(TelemetryBase):
                         self.power_throttle_count = getattr(self, 'power_throttle_count', 0) + 1
                     if throttle_status & 0x2:  # Thermal limit
                         reasons.append("THERMAL")
+                        thermal_slowdown = 1
                         self.thermal_throttle_count = getattr(self, 'thermal_throttle_count', 0) + 1
                     if throttle_status & 0x4:  # Current limit
                         reasons.append("CURRENT")
@@ -966,6 +968,7 @@ class RocmTelemetry(TelemetryBase):
                 "mem_total_MB": mem_total_MB,
                 "mem_free_MB": mem_free_MB,
                 "throttled": throttled,
+                "thermal_slowdown": thermal_slowdown,
             }
         else:  # CPU/APU
             try:
@@ -1132,6 +1135,55 @@ MEMORY_DEFAULT_MPS_MB = 8000  # Conservative fallback for Apple Metal (8GB)
 MEMORY_DEFAULT_CPU_MB = 16000  # Fallback for CPU mode (16GB)
 MEMORY_DEFAULT_FALLBACK_MB = 8000  # Ultimate fallback (8GB)
 
+# ── Melt Mode (TIM settling) Constants ─────────────────────────────────
+# Thermal Interface Material on freshly installed GPU modules settles only
+# under thermal *cycling* (CUG 2026, §5): many short GEMM bursts separated by
+# a cool gap, until performance stops climbing.  Defaults mirror xkdgemm.sh
+# --tim-settling; every value is also a CLI flag / YAML key.
+MELT_BURST_MS = 140           # Target length of one hot burst
+MELT_COOL_MS = 100            # Minimum cool gap per cycle, reload included (sleep tops it up)
+MELT_MNK = 4096               # Melt GEMM side; independent of the characterization --m/--n/--k
+MELT_BATCH = 8                # Melt GEMM batch; independent of --batch-count-gemm
+MELT_MAX_DURATION_S = 3600.0  # Melt is a fixed dose: cycle for an hour, then judge the final window.
+MELT_MIN_DURATION_S = 3600.0  # min == max by default; a lower min lets a known-settled module stop early
+MELT_WINDOW_S = 60            # Trailing window used for the settled decision
+MELT_BIN_S = 10.0             # Bin width inside the window; plateau CV is taken over bin means
+MELT_MIN_BINS = 3             # Fewest non-empty bins that can make a plateau judgement
+MELT_PLATEAU_CV_PCT = 1.0     # Max coefficient of variation of the per-bin mean GFLOPS
+MELT_SETTLED_PCT = 98.0       # Window mean must reach this % of the best window
+MELT_TEMP_SLOPE_C_PER_MIN = 0.5   # Max |slope| of the bin-mean GPU temperature, °C/min; 0 disables the rule.
+                                  # TIM spreading keeps lowering die temperature at equal power after
+                                  # GFLOP/s has plateaued (field run 2, GPU1: -1.1 °C/min at the 300 s gate)
+MELT_TEMP_WINDOW_S = 300.0        # Horizon for the temperature slope.  Thermal time
+                                  # constants are minutes: a 60 s window sees -0.4 °C/min where the 5 min
+                                  # trend is -1.1 (field run 2, GPU1), and its estimate carries ±0.2 °C/min noise
+MELT_TEMP_SIBLING_WARN_C = 5.0    # Multi-GPU parent: warn when a GPU ends the dose this much hotter
+                                  # than its equal-power siblings; 0 disables.  Never gates SETTLED.
+                                  # Healthy GPUs end within ~2 °C of each other (4 GH200 nodes);
+                                  # field run 5 GPU1 ended +8.1 °C, field run 3 GPU2 +10.7 °C
+MELT_SIBLING_POWER_TOLERANCE_PCT = 5.0   # Siblings must draw mean power within this % of each other
+DTYPE_BYTES = {
+    "float16": 2, "bfloat16": 2, "float32": 4, "float64": 8,
+    "complex64": 8, "complex128": 16,
+}
+MELT_MAX_WORKING_SET_MB = 4096  # --stress-test cap on melt operands (A+B); the cool gap only needs
+                                # ~100 ms of H2D traffic, and the host mirrors this footprint
+MELT_PROGRESS_INTERVAL_S = 60  # Progress log cadence during an unattended melt
+MELT_CALIBRATION_MATMULS = 3   # Timed matmuls used to size one burst
+MELT_RELOAD_SAMPLE_CYCLES = 10  # Cycles whose reload time is measured before the cool-gap line is logged
+MELT_MIN_MS_PER_MATMUL = 1.0   # Below this a matmul is too small to heat a die
+MELT_MAX_OPS_PER_BURST = 200   # Above this the burst is launch-bound, not compute-bound
+MELT_BENCHMARK_NAME = "Melt"
+# Extra keys melt_test() adds to its perf dict (exported to JSON alongside the common ones)
+MELT_RESULT_FIELDS = ('settled', 'settle_s', 'cycles', 'start_gflops', 'plateau_gflops',
+                      'thermal_throttle_cycles', 'last_throttle_s', 'ops_per_burst',
+                      'burst_ms_measured', 'reload_path', 'reload_ms_measured', 'duty_cycle_pct',
+                      'power_min_W', 'power_max_W', 'stop_reason', 'stop_rules_failed',
+                      'plateau_cv_pct', 'cycle_cv_pct',
+                      'temp_slope_c_per_min', 'window_temp_mean_C', 'temp_mean_C', 'temp_max_C',
+                      'temp_sibling_delta_C', 'start_temp_C', 'end_temp_C', 'power_mean_W',
+                      'start_throttle_cycles', 'end_throttle_cycles')
+
 class TelemetryThread:
     """Background thread for continuous telemetry monitoring with zero GPU interrupts."""
     
@@ -1188,6 +1240,16 @@ class TelemetryThread:
         with self.lock:
             self.current_iteration = None
             self.iteration_start_time = None
+
+    def clear_iteration_samples(self):
+        """Forget per-iteration samples so the next benchmark starts clean.
+
+        Iteration numbers restart at 0 for every benchmark; without this the
+        samples of iteration *i* from one benchmark would be prepended to
+        iteration *i* of the next.
+        """
+        with self.lock:
+            self.iteration_samples = {}
     
     def get_latest(self) -> Dict[str, Any]:
         """Get most recent telemetry reading (non-blocking)."""
@@ -1514,8 +1576,171 @@ _SUMMARY_CSV_FIELDNAMES = ['test', 'dtype', 'gpu', 'serial', 'performance', 'uni
                            'power_avg_W', 'temp_max_C', 'status', 'notes']
 
 
+def _is_melt(bench: dict) -> bool:
+    return bench.get('name') == MELT_BENCHMARK_NAME
+
+
+def _format_melt_duration(seconds: float) -> str:
+    """``"45 s"`` below two minutes, ``"78.4 min"`` above — melts span both scales."""
+    return f"{seconds:.0f} s" if seconds < 120 else f"{seconds / 60:.1f} min"
+
+
+def _melt_trajectory_note(bench: dict) -> str:
+    """``"(23,900 → 54,120)"`` — where the module started and where it ended up."""
+    start, plateau = bench.get('start_gflops'), bench.get('plateau_gflops')
+    if start is None or plateau is None:
+        return ""
+    return f" ({start:,.0f} → {plateau:,.0f})"
+
+
+def _melt_sibling_note(bench: dict) -> str:
+    """``" · hot vs siblings (+15.3 °C)"`` once the multi-GPU parent has found an offset, else empty."""
+    delta = bench.get('temp_sibling_delta_C')
+    return f" · hot vs siblings ({delta:+.1f} °C)" if delta is not None else ""
+
+
+def _melt_status(bench: dict) -> Tuple[str, str]:
+    """Melt PASS/FAIL is "settled / not settled".
+
+    Thermal throttling *during* a melt is the expected signature of unsettled
+    TIM, so the generic "Throttled" verdict does not apply.  A sibling
+    temperature offset is appended as a note; it never changes the status.
+    """
+    trajectory = _melt_trajectory_note(bench) + _melt_sibling_note(bench)
+    if bench.get('settled'):
+        settle_s = bench.get('settle_s')
+        detail = f" in {_format_melt_duration(settle_s)}" if settle_s is not None else ""
+        return "PASS", f"Settled{detail}{trajectory}"
+    return "FAIL", f"Not settled{trajectory}"
+
+
+def _summary_performance(bench: dict) -> float:
+    """The headline number for the summary table.
+
+    For melt that is the plateau the GPU reached, not the whole-run mean,
+    which the throttled start drags down.  JSON keeps the raw cycle stats.
+    """
+    if _is_melt(bench) and bench.get('plateau_gflops') is not None:
+        return bench['plateau_gflops']
+    return bench['mean']
+
+
+def _unsettled_melts(benchmarks: List[dict]) -> List[dict]:
+    return [b for b in benchmarks if b and _is_melt(b) and not b.get('settled')]
+
+
+def _run_closing_line(dev_label: str, benchmarks: List[dict]) -> str:
+    """``[OK] ...`` unless a melt on this device did not settle — then say so last, where eyes land."""
+    unsettled = _unsettled_melts(benchmarks)
+    if not unsettled:
+        return f"[OK] Benchmark run finished on {dev_label}"
+    runtime_s = unsettled[-1].get('runtime_s') or 0.0
+    return (f"[FAIL] Melt: {dev_label} NOT SETTLED after {_format_melt_duration(runtime_s)} "
+            f"— see 'NOT SETTLED' line above")
+
+
+def _multi_gpu_melt_closing_line(results: List[dict]) -> Optional[str]:
+    """Parent-side closing line naming every GPU whose melt did not settle, or None."""
+    failed = [r['gpu_index'] for r in results if _unsettled_melts(r.get('benchmarks', []))]
+    if not failed:
+        return None
+    gpus = ", ".join(f"GPU {g}" for g in sorted(failed))
+    return f"[FAIL] Melt: NOT SETTLED on {gpus} — see 'NOT SETTLED' lines above"
+
+
+class _SiblingTempWarning(NamedTuple):
+    gpu_index: int
+    delta_c: float
+    own_temp_c: float
+    sibling_median_c: float
+    power_w: float
+    message: str
+
+
+class _MeltThermalReading(NamedTuple):
+    gpu_index: int
+    bench: dict
+    temp_c: float
+    power_w: float
+
+
+def _melt_thermal_readings(results: List[dict]) -> List[_MeltThermalReading]:
+    """One ``(gpu, melt result, end-of-dose temp, mean power)`` per GPU whose melt has both numbers.
+
+    The temperature is ``end_temp_C`` (the last ``--melt-window-s``), not the
+    run average: a GPU that started hot and cooled to match its siblings is
+    fine, and one that is still hotter after the dose is the one to look at.
+    """
+    readings = []
+    for result in results:
+        for bench in result.get('benchmarks', []):
+            if not (bench and _is_melt(bench)):
+                continue
+            temp, power = bench.get('end_temp_C'), bench.get('telemetry', {}).get('power_W_mean')
+            if temp is not None and power:
+                readings.append(_MeltThermalReading(result['gpu_index'], bench, temp, power))
+                break
+    return readings
+
+
+def _sibling_temp_message(gpu_index: int, delta_c: float, own_c: float, median_c: float, power_w: float) -> str:
+    return (f"[GPU{gpu_index} Melt] ends the dose {delta_c:.1f} °C hotter than siblings at equal power "
+            f"({own_c:.1f} vs {median_c:.1f} °C @ {power_w:.0f} W) — check thermal path "
+            f"(TIM coverage, mount pressure, coolant flow position)")
+
+
+def _melt_sibling_temp_warnings(results: List[dict], warn_c: float,
+                                power_tolerance_pct: float = MELT_SIBLING_POWER_TOLERANCE_PCT
+                                ) -> List[_SiblingTempWarning]:
+    """GPUs whose end-of-dose temperature exceeds the median of their equal-power siblings by > ``warn_c``.
+
+    TIM spreading lowers thermal resistance, so at equal power a well-seated
+    module runs cooler; a GPU that is much hotter than siblings drawing the
+    same power has a thermal-path problem even if its GFLOP/s settled.
+    Siblings are other GPUs with a melt result whose mean power is within
+    ``power_tolerance_pct`` of this GPU's; without one there is no comparison.
+    ``warn_c`` ≤ 0 disables.  Diagnostic only — never gates SETTLED.
+    """
+    if warn_c <= 0:
+        return []
+    readings = _melt_thermal_readings(results)
+    warnings = []
+    for reading in readings:
+        tolerance_w = reading.power_w * power_tolerance_pct / 100.0
+        siblings = [other.temp_c for other in readings
+                    if other.gpu_index != reading.gpu_index and abs(other.power_w - reading.power_w) <= tolerance_w]
+        if not siblings:
+            continue
+        median_c = statistics.median(siblings)
+        delta_c = reading.temp_c - median_c
+        if delta_c > warn_c:
+            warnings.append(_SiblingTempWarning(
+                reading.gpu_index, delta_c, reading.temp_c, median_c, reading.power_w,
+                _sibling_temp_message(reading.gpu_index, delta_c, reading.temp_c, median_c, reading.power_w)))
+    return warnings
+
+
+def _annotate_sibling_temp_deltas(results: List[dict], warnings: List[_SiblingTempWarning]) -> None:
+    """Store each warning's offset on that GPU's melt result (summary note and JSON ``temp_sibling_delta_C``)."""
+    deltas = {warning.gpu_index: round(warning.delta_c, 1) for warning in warnings}
+    for reading in _melt_thermal_readings(results):
+        if reading.gpu_index in deltas:
+            reading.bench['temp_sibling_delta_C'] = deltas[reading.gpu_index]
+
+
+def _melt_sibling_warn_threshold(results: List[dict], args) -> float:
+    """The threshold the melts ran with (so a YAML ``temp_sibling_warn_c`` applied in the children counts), else the flag."""
+    for reading in _melt_thermal_readings(results):
+        configured = reading.bench.get('params', {}).get('temp_sibling_warn_c')
+        if configured is not None:
+            return configured
+    return args.melt_temp_sibling_warn_c
+
+
 def _summary_status(bench: dict, tel_stats: dict, efficiency_warn_pct: float) -> Tuple[str, str]:
     """Return ``(status, notes)`` for one benchmark on one GPU."""
+    if _is_melt(bench):
+        return _melt_status(bench)
     throttled = tel_stats.get('throttled', False) or bench.get('telemetry', {}).get('throttled', False)
     efficiency = bench.get('efficiency_pct', None)
     if throttled:
@@ -1580,7 +1805,7 @@ def _group_summary_benchmarks(results: List[dict], efficiency_warn_pct: float) -
             groups[test_key]['results'].append({
                 'gpu': gpu_idx,
                 'serial': serial,
-                'performance': bench['mean'],
+                'performance': _summary_performance(bench),
                 'power_avg': bench_tel.get('power_W_mean', tel_stats.get('power_W_mean', 0)),
                 'temp_max': bench_tel.get('temp_gpu_C_max', tel_stats.get('temp_gpu_C_max', 0)),
                 'status': status,
@@ -1812,6 +2037,13 @@ def _build_syslog_row(perf: dict, tel_data: dict, gpu_index: int,
     if perf.get('throttled'):
         row['throttled'] = 'true'
 
+    # Melt (TIM settling): status follows the settled decision, not throttling
+    if _is_melt(perf):
+        row['status'] = _melt_status(perf)[0]
+        row['settled'] = 'true' if perf.get('settled') else 'false'
+        if perf.get('settle_s') is not None:
+            row['settle_s'] = f"{perf['settle_s']:.1f}"
+
     if verbose:
         row.update({
             'sm_util_mean':     f"{tel_s['sm_util_mean']:.0f}" if 'sm_util_mean' in tel_s else '',
@@ -1840,6 +2072,9 @@ def _log_summary(name, vals, unit, logger, tel, device, params=None, baselines=N
     iteration_telemetry = []
     if tel_thread:
         with tel_thread.lock:
+            # Samples stored per iteration are the same objects as in all_samples;
+            # an identity index keeps this linear for long runs (melt: 10^4+ cycles).
+            sample_timestamps = {id(reading): ts for ts, reading in tel_thread.all_samples}
             # Get all iterations that have telemetry samples
             for iter_num in sorted(tel_thread.iteration_samples.keys()):
                 samples = tel_thread.iteration_samples[iter_num]
@@ -1847,11 +2082,7 @@ def _log_summary(name, vals, unit, logger, tel, device, params=None, baselines=N
                     # Get corresponding performance value and timestamp
                     perf_value = vals[iter_num]
                     # Use timestamp from first sample in iteration window
-                    timestamp = None
-                    for ts, reading in tel_thread.all_samples:
-                        if reading == samples[0]:
-                            timestamp = ts
-                            break
+                    timestamp = sample_timestamps.get(id(samples[0]))
                     
                     iteration_telemetry.append({
                         'iteration': iter_num,
@@ -2390,17 +2621,50 @@ def get_available_memory_mb(device: torch.device) -> float:
         return MEMORY_DEFAULT_CPU_MB
 
 
+_STRESS_GEMM_BATCH = 64            # Smaller batch to reduce memory pressure
+_STRESS_GEMM_SIDE_RANGE = (512, 16384)
+
+
+def _square_gemm_stress_dims(usable_bytes: float, bytes_per_elem: int,
+                             per_matrix_cap_bytes: Optional[float] = None) -> Tuple[int, int]:
+    """``(batch, side)`` for a square batched GEMM that fits ``usable_bytes``.
+
+    GEMM holds 2 inputs + 1 output = 3 matrices of ``B*side²`` elements; an
+    optional per-matrix cap lets a caller bound the size below what memory
+    would allow.
+    """
+    per_matrix_bytes = usable_bytes / 3
+    if per_matrix_cap_bytes is not None:
+        per_matrix_bytes = min(per_matrix_bytes, per_matrix_cap_bytes)
+    batch = _STRESS_GEMM_BATCH
+    side = int((per_matrix_bytes / bytes_per_elem / batch) ** 0.5)
+    low, high = _STRESS_GEMM_SIDE_RANGE
+    return batch, max(low, min(side, high))
+
+
+def _melt_stress_dims(usable_bytes: float, bytes_per_elem: int) -> Tuple[int, int]:
+    """Melt sizes like GEMM but never beyond ``MELT_MAX_WORKING_SET_MB`` of operands.
+
+    The cool gap only needs to idle the SMs for ~100 ms of host→device traffic
+    (4 GB at 25–50 GB/s already is), and the host mirrors the operand set; so
+    the cap is deliberately independent of how much GPU memory is available.
+    """
+    operand_cap_bytes = MELT_MAX_WORKING_SET_MB * 1024**2
+    return _square_gemm_stress_dims(usable_bytes, bytes_per_elem, per_matrix_cap_bytes=operand_cap_bytes / 2)
+
+
+def _melt_host_footprint_bytes(batch: int, m: int, n: int, k: int, bytes_per_elem: int) -> int:
+    """Host memory the h2d cool gap mirrors: one copy of A (B×M×K) and B (B×K×N)."""
+    return batch * (m * k + k * n) * bytes_per_elem
+
+
 def calculate_stress_params(benchmark: str, precision: str, available_mb: float, log, args=None) -> Dict[str, int]:
     """Calculate maximum stress test parameters that fit in memory.
     
     If args is provided, uses CLI-specified values where available (e.g., density).
     Only auto-calculates size parameters to fit memory.
     """
-    dtype_bytes = {
-        "float16": 2, "bfloat16": 2, "float32": 4, "float64": 8,
-        "complex64": 8, "complex128": 16
-    }
-    bytes_per_elem = dtype_bytes.get(precision, 4)
+    bytes_per_elem = DTYPE_BYTES.get(precision, 4)
     
     # Use configured ratio of available memory for safety
     # (PyTorch overhead, workspace buffers, gradients, etc.)
@@ -2410,16 +2674,17 @@ def calculate_stress_params(benchmark: str, precision: str, available_mb: float,
     params = {}
     
     if benchmark == "gemm":
-        # GEMM: 2 input matrices + 1 output = 3 matrices total
-        # Memory = B * (M*K + K*N + M*N) * bytes
-        # For square matrices: B * 3*M^2 * bytes
-        batch = 64  # Smaller batch to reduce memory pressure
-        total_elems = usable_bytes / bytes_per_elem / 3  # 3 matrices
-        side = int((total_elems / batch) ** 0.5)
-        side = max(512, min(side, 16384))  # Clamp to reasonable range
+        batch, side = _square_gemm_stress_dims(usable_bytes, bytes_per_elem)
         params = {"m": side, "n": side, "k": side, "batch_count_gemm": batch}
         est_mb = batch * 3 * side * side * bytes_per_elem / 1024**2
         log.info(f"[Stress Test] GEMM: {batch}x{side}x{side}x{side} (est {est_mb:.0f}MB of {available_mb:.0f}MB available)")
+
+    elif benchmark == "melt":
+        batch, side = _melt_stress_dims(usable_bytes, bytes_per_elem)
+        params = {"melt_m": side, "melt_n": side, "melt_k": side, "melt_batch_count": batch}
+        operand_mb = _melt_host_footprint_bytes(batch, side, side, side, bytes_per_elem) / 1024**2
+        log.info(f"[Stress Test] Melt: {batch}x{side}x{side}x{side} (operands {operand_mb:.0f}MB, "
+                 f"cap {MELT_MAX_WORKING_SET_MB}MB; host mirror ≈ {operand_mb:.0f}MB, pinned allocator may round up)")
     
     elif benchmark == "convolution":
         # Conv: input (B*Ci*H*W) + output (B*Co*H*W) + weights (Co*Ci*K*K)
@@ -2533,6 +2798,7 @@ _STRESS_PRECISION_ATTRS = {
     "schrodinger": "precision_schrodinger",
     "atomic": "precision_atomic",
     "sparse": "precision_sparse",
+    "melt": "precision_melt",
 }
 
 
@@ -2645,6 +2911,870 @@ def batched_gemm_test(a, dev, log, tel, tel_thread, prn):
         import traceback
         log.error(f"[{dev_label_str} Batched GEMM] Traceback: {traceback.format_exc()}")
         return None
+
+
+# ───────────────────────────────────────────────────────────────────────
+# 5a. MELT MODE (TIM SETTLING)  ─────────────────────────────────────────
+# Thermal Interface Material on a freshly installed GPU module spreads only
+# under thermal cycling: a short GEMM burst heats the die, a host→device
+# matrix reload (SMs idle, copy engines busy) lets it cool, repeat.  The GPU
+# starts heavily thermally throttled and climbs to a stable plateau; "settled"
+# is decided on a trailing time window by the pure function melt_converged().
+class MeltCycle(NamedTuple):
+    """One heat/cool cycle of a melt run.
+
+    The first four slots are the convergence record ``melt_converged`` reads:
+    ``(t_s, gflops, thermal_throttled, temp_mean_C)``; plain tuples of three or
+    four elements are accepted there too.
+    """
+    t_s: float
+    gflops: float
+    thermal_throttled: bool
+    temp_mean_C: Optional[float] = None   # mean GPU temperature over the cycle's samples
+    temp_max_C: Optional[float] = None
+    power_min_W: Optional[float] = None
+    power_max_W: Optional[float] = None
+    reload_ms: float = 0.0
+    power_mean_W: Optional[float] = None
+
+
+def _sample_thermal_throttled(sample: Dict[str, Any]) -> bool:
+    """True if a telemetry sample shows *thermal* slowdown.
+
+    Power-brake (``power_limit``) is deliberately excluded: it is the configured
+    power cap, not TIM.  CPU/MPS/Intel samples carry none of these keys.
+    """
+    return bool(sample.get('hw_slowdown') or sample.get('sw_slowdown')
+                or sample.get('thermal_slowdown'))
+
+
+class _CycleTelemetry(NamedTuple):
+    thermal_throttled: bool
+    power_min_W: Optional[float]
+    power_max_W: Optional[float]
+    temp_mean_C: Optional[float]
+    temp_max_C: Optional[float]
+    power_mean_W: Optional[float]
+
+
+def _numeric_samples(samples: List[Dict[str, Any]], key: str) -> List[float]:
+    return [s[key] for s in samples if isinstance(s.get(key), (int, float))]
+
+
+def _melt_cycle_telemetry(tel_thread, cycle: int) -> _CycleTelemetry:
+    """Throttle flag, power trough/peak and temperature mean/max over one cycle's samples."""
+    with tel_thread.lock:
+        samples = list(tel_thread.iteration_samples.get(cycle, []))
+    thermal_throttled = any(_sample_thermal_throttled(s) for s in samples)
+    powers = _numeric_samples(samples, 'power_W')
+    temps = _numeric_samples(samples, 'temp_gpu_C')
+    return _CycleTelemetry(thermal_throttled,
+                           min(powers) if powers else None, max(powers) if powers else None,
+                           statistics.mean(temps) if temps else None, max(temps) if temps else None,
+                           statistics.mean(powers) if powers else None)
+
+
+def _record_temp(record) -> Optional[float]:
+    """Temperature slot of a convergence record; None for 3-tuples and CPU/MPS cycles."""
+    return record[3] if len(record) > 3 else None
+
+
+def _trailing_window(records, now_s: float, window_s: float) -> list:
+    """Records with ``now_s - window_s <= t_s <= now_s``, oldest first.
+
+    Records are appended in time order, so walking back from the newest and
+    stopping at the first one outside the window keeps this O(window) per
+    cycle instead of O(all cycles) — melt runs accumulate 10^4+ cycles.
+    """
+    cutoff = now_s - window_s
+    window = []
+    for record in reversed(records):
+        if record[0] > now_s:
+            continue
+        if record[0] < cutoff:
+            break
+        window.append(record)
+    window.reverse()
+    return window
+
+
+def _cv_pct(values: List[float]) -> float:
+    mean = statistics.mean(values)
+    return statistics.stdev(values) / mean * 100.0 if mean > 0 else float('inf')
+
+
+_BIN_FIT_TOLERANCE = 1e-9   # relative; 0.6 / 0.2 is 2.9999999999999996 in binary floating point
+
+
+def _bins_in_window(window_s: float, bin_s: float) -> int:
+    """Number of whole bins of bin_s that fit in window_s (at least 1), tolerant of decimal rounding."""
+    return max(1, int(window_s / bin_s + _BIN_FIT_TOLERANCE))
+
+
+class _Bin(NamedTuple):
+    t_centre_s: float
+    mean: float
+
+
+def _binned(window, now_s: float, window_s: float, bin_s: float, value_of) -> List[_Bin]:
+    """Mean of ``value_of(record)`` per non-empty ``bin_s`` bin, bins aligned to the window end.
+
+    Records whose value is None (no temperature on CPU/MPS) are skipped.
+    """
+    bin_count = _bins_in_window(window_s, bin_s)
+    bins: List[List[float]] = [[] for _ in range(bin_count)]
+    for record in window:
+        value = value_of(record)
+        if value is None:
+            continue
+        index = min(int((now_s - record[0]) // bin_s), bin_count - 1)
+        bins[index].append(value)
+    return [_Bin(now_s - (index + 0.5) * bin_s, statistics.mean(values))
+            for index, values in enumerate(bins) if values]
+
+
+def _bin_means(window, now_s: float, window_s: float, bin_s: float) -> List[float]:
+    """Mean GFLOPS of each non-empty ``bin_s`` bin, bins aligned to the window end.
+
+    Per-cycle GFLOPS of a ~140 ms burst jitter by 1–2 % under DVFS even on a
+    perfectly settled die; averaging each bin first measures whether the
+    *plateau* moves, not whether individual bursts do.
+    """
+    return [b.mean for b in _binned(window, now_s, window_s, bin_s, lambda record: record[1])]
+
+
+def _least_squares_slope(xs: List[float], ys: List[float]) -> float:
+    x_mean, y_mean = statistics.mean(xs), statistics.mean(ys)
+    covariance = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys))
+    variance = sum((x - x_mean) ** 2 for x in xs)
+    return covariance / variance
+
+
+def _temp_slope_c_per_min(window, now_s: float, window_s: float, bin_s: float) -> Optional[float]:
+    """Least-squares slope of the bin-mean temperature across bin centres, °C/min.
+
+    None with fewer than ``MELT_MIN_BINS`` bins carrying temperature — the
+    rule is then skipped, never failed.
+    """
+    bins = _binned(window, now_s, window_s, bin_s, _record_temp)
+    if len(bins) < MELT_MIN_BINS:
+        return None
+    return _least_squares_slope([b.t_centre_s for b in bins], [b.mean for b in bins]) * 60.0
+
+
+def _window_temp_mean(window) -> Optional[float]:
+    temps = [temp for temp in map(_record_temp, window) if temp is not None]
+    return statistics.mean(temps) if temps else None
+
+
+class _WindowStats(NamedTuple):
+    mean: float
+    plateau_cv_pct: Optional[float]   # CV over bin means; None with too few bins
+    cycle_cv_pct: float               # CV over individual cycles (reported, not judged)
+    bins: int
+    throttle_count: int
+
+
+def _window_stats(window, now_s: float, window_s: float, bin_s: float) -> _WindowStats:
+    """Stats of ≥2 records ``(t_s, gflops, thermal_throttled, ...)`` in the trailing window."""
+    values = [r[1] for r in window]
+    bin_means = _bin_means(window, now_s, window_s, bin_s)
+    plateau_cv = _cv_pct(bin_means) if len(bin_means) >= MELT_MIN_BINS else None
+    return _WindowStats(statistics.mean(values), plateau_cv, _cv_pct(values), len(bin_means),
+                        sum(1 for r in window if r[2]))
+
+
+def _raise_best(best: Optional[float], candidate: float) -> float:
+    return candidate if best is None else max(best, candidate)
+
+
+class _SettleRules(NamedTuple):
+    """The thresholds one melt is judged against (see ``melt_converged``)."""
+    min_duration_s: float
+    window_s: float
+    bin_s: float
+    plateau_cv_pct: float
+    settled_pct: float
+    target_gflops: Optional[float]
+    temp_slope_c_per_min: float
+    temp_window_s: float
+
+    @classmethod
+    def from_args(cls, a) -> "_SettleRules":
+        return cls(min_duration_s=a.melt_min_duration, window_s=a.melt_window_s, bin_s=a.melt_bin_s,
+                   plateau_cv_pct=a.melt_plateau_cv_pct, settled_pct=a.melt_settled_pct,
+                   target_gflops=a.melt_target_gflops, temp_slope_c_per_min=a.melt_temp_slope_c_per_min,
+                   temp_window_s=a.melt_temp_window_s)
+
+    @property
+    def judges_temperature(self) -> bool:
+        return self.temp_slope_c_per_min > 0
+
+
+def melt_converged(records, now_s: float, *, min_duration_s: float, window_s: float, bin_s: float,
+                   plateau_cv_pct: float, settled_pct: float,
+                   target_gflops: Optional[float] = None,
+                   temp_slope_c_per_min: float = MELT_TEMP_SLOPE_C_PER_MIN,
+                   temp_window_s: float = MELT_TEMP_WINDOW_S,
+                   best_window_mean: Optional[float] = None) -> Tuple[bool, Dict[str, Any]]:
+    """Decide whether a melt run has settled, from its cycle records alone.
+
+    ``records`` are ``(t_s, gflops, thermal_throttled[, temp_mean_C], ...)``
+    tuples ordered by time.  All of the following must hold over the trailing
+    ``window_s`` seconds:
+
+    * ``now_s`` ≥ ``min_duration_s`` and the window holds ≥ 2 cycles spread
+      over at least ``MELT_MIN_BINS`` non-empty ``bin_s`` bins;
+    * no cycle in the window was thermally throttled;
+    * coefficient of variation of the *per-bin mean* GFLOPS ≤ ``plateau_cv_pct``
+      (per-cycle jitter under DVFS is reported as ``cycle_cv_pct`` but not judged);
+    * window mean ≥ ``settled_pct`` % of the best *eligible* window mean seen
+      so far — guards against "stable but still low".  A window is eligible
+      to set the bar only if it could itself have been the plateau: past
+      ``min_duration_s`` and free of thermal throttling.  Cold-boost windows
+      inside the gate and throttled spikes therefore never trap an otherwise
+      healthy GPU in "Not settled".  ``best_window_mean`` is passed in by the
+      caller and returned updated in ``info['best']``;
+    * window mean ≥ ``target_gflops`` when a floor is given;
+    * |least-squares slope of the bin-mean GPU temperature| ≤
+      ``temp_slope_c_per_min`` over the trailing ``temp_window_s`` seconds —
+      a longer horizon than the performance window, because thermal time
+      constants are minutes.  Performance saturates once the die is
+      below the throttle point, but spreading TIM keeps lowering its
+      temperature at equal power — so temperature still carries information
+      after GFLOP/s has stopped moving.  Only the *trend* is judged, never an
+      absolute temperature (inlet water 15–39 °C has no performance effect;
+      an absolute threshold would be site-dependent).  Skipped, not failed,
+      with fewer than ``MELT_MIN_BINS`` temperature bins (CPU/MPS: no
+      temperature at all) or when the limit is 0.
+
+    Returns ``(settled, info)`` where ``info`` carries ``window_mean``,
+    ``window_cv`` (bin-based), ``cycle_cv_pct``, ``bins``, ``best``,
+    ``throttle_count``, ``temp_slope_c_per_min`` (None when skipped),
+    ``window_temp_mean_C``, ``rules_failed`` (names, in evaluation order) and
+    a human-readable ``reason`` (the first failing rule).
+    """
+    rules = _SettleRules(min_duration_s, window_s, bin_s, plateau_cv_pct, settled_pct, target_gflops,
+                         temp_slope_c_per_min, temp_window_s)
+    info: Dict[str, Any] = {'window_mean': None, 'window_cv': None, 'cycle_cv_pct': None, 'bins': 0,
+                            'best': best_window_mean, 'throttle_count': 0,
+                            'temp_slope_c_per_min': None, 'window_temp_mean_C': None,
+                            'rules_failed': [], 'reason': ''}
+    window = _trailing_window(records, now_s, window_s)
+    if len(window) < 2:
+        info['reason'] = f"fewer than 2 cycles in the last {window_s:g} s"
+        return False, info
+
+    stats = _window_stats(window, now_s, window_s, bin_s)
+    eligible = now_s >= min_duration_s and stats.throttle_count == 0
+    best = _raise_best(best_window_mean, stats.mean) if eligible else best_window_mean
+    temp_slope = _judged_temp_slope(records, window, now_s, rules)
+    info.update(window_mean=stats.mean, window_cv=stats.plateau_cv_pct, cycle_cv_pct=stats.cycle_cv_pct,
+                bins=stats.bins, best=best, throttle_count=stats.throttle_count,
+                temp_slope_c_per_min=temp_slope, window_temp_mean_C=_window_temp_mean(window))
+
+    failures = _plateau_rule_failures(stats, temp_slope, now_s, best, rules)
+    info['rules_failed'] = [name for name, _ in failures]
+    info['reason'] = failures[0][1] if failures else "settled"
+    return not failures, info
+
+
+def _judged_temp_slope(records, window, now_s: float, rules: _SettleRules) -> Optional[float]:
+    """Temperature slope over the temperature horizon, or None when the rule is off or short of bins."""
+    if not rules.judges_temperature:
+        return None
+    if rules.temp_window_s != rules.window_s:
+        window = _trailing_window(records, now_s, rules.temp_window_s)
+    return _temp_slope_c_per_min(window, now_s, rules.temp_window_s, rules.bin_s)
+
+
+def _plateau_rule_failures(stats: _WindowStats, temp_slope: Optional[float], now_s: float,
+                           best: Optional[float], rules: _SettleRules) -> List[Tuple[str, str]]:
+    """Every settled rule that fails, as ``(rule_name, reason)`` in evaluation order."""
+    failures = []
+    if now_s < rules.min_duration_s:
+        failures.append(("min_duration", f"min duration {rules.min_duration_s:g} s not reached"))
+    if stats.throttle_count:
+        failures.append(("thermal_throttle", f"thermal throttling in window ({stats.throttle_count} cycles)"))
+    if stats.plateau_cv_pct is None:
+        failures.append(("bins", f"not enough bins ({stats.bins} of {MELT_MIN_BINS} needed, {rules.bin_s:g} s each)"))
+    elif stats.plateau_cv_pct > rules.plateau_cv_pct:
+        failures.append(("plateau_cv", f"plateau CV {stats.plateau_cv_pct:.2f}% > {rules.plateau_cv_pct:g}%"))
+    if best is not None and stats.mean < best * rules.settled_pct / 100.0:   # best is None only in an ineligible window
+        failures.append(("below_best", f"window mean is {stats.mean / best * 100:.1f}% of best ({best:,.0f}), "
+                                       f"need {rules.settled_pct:g}%"))
+    if rules.target_gflops is not None and stats.mean < rules.target_gflops:
+        failures.append(("below_target", f"window mean {stats.mean:,.0f} below target {rules.target_gflops:,.0f} GFLOP/s"))
+    if temp_slope is not None and abs(temp_slope) > rules.temp_slope_c_per_min:
+        failures.append(("temp_slope", f"temperature still trending {temp_slope:+.1f} °C/min "
+                                       f"(limit {rules.temp_slope_c_per_min:g})"))
+    return failures
+
+
+class _ConvergenceTracker:
+    """Carries the best eligible window mean across ``melt_converged`` calls."""
+
+    def __init__(self, rules: _SettleRules):
+        self._rules = rules
+        self.best_window_mean: Optional[float] = None
+
+    @classmethod
+    def from_args(cls, a) -> "_ConvergenceTracker":
+        return cls(_SettleRules.from_args(a))
+
+    def update(self, records, now_s: float) -> Tuple[bool, Dict[str, Any]]:
+        settled, info = melt_converged(records, now_s, best_window_mean=self.best_window_mean,
+                                       **self._rules._asdict())
+        self.best_window_mean = info['best']
+        return settled, info
+
+
+def _seconds_with_minutes(seconds: float) -> str:
+    """``"3600 s (60 min)"`` — operators think in minutes, flags are in seconds."""
+    return f"{seconds:g} s ({seconds / 60:g} min)"
+
+
+def _melt_dry_run_line(args) -> str:
+    melt_b, melt_m, melt_n, melt_k = _melt_dims(args)
+    bytes_per_elem = DTYPE_BYTES.get(args.precision_melt, 4)
+    tensor_mb = _melt_host_footprint_bytes(melt_b, melt_m, melt_n, melt_k, bytes_per_elem) / 1024**2
+    return (f"  - Melt (TIM settling, runs first): {melt_b}x{melt_m}x{melt_n}x{melt_k} ({args.precision_melt}) ~{tensor_mb:.1f}MB, "
+            f"burst {args.melt_burst_ms:g}ms, cool {args.melt_cool_ms:g}ms, window {args.melt_window_s:g}s, "
+            f"bin {args.melt_bin_s:g}s, {_temp_rule_summary(args)}, "
+            f"min {_seconds_with_minutes(args.melt_min_duration)}, max {_seconds_with_minutes(args.melt_max_duration)}"
+            f"{' [melt-only]' if args.melt_only else ''}")
+
+
+def _temp_rule_summary(args) -> str:
+    """``temp slope ≤ 0.5 °C/min over 300 s``, or ``temp slope off``."""
+    if args.melt_temp_slope_c_per_min <= 0:
+        return "temp slope off"
+    return f"temp slope ≤ {args.melt_temp_slope_c_per_min:g} °C/min over {args.melt_temp_window_s:g} s"
+
+
+def _annotate_dry_run_skips(selected: List[str], melt_only: bool) -> List[str]:
+    """With ``--melt-only`` every line after the melt line is announced as skipped."""
+    if not melt_only or not selected:
+        return selected
+    return selected[:1] + [f"{line} (skipped: --melt-only)" for line in selected[1:]]
+
+
+def _melt_dims(a) -> Tuple[int, int, int, int]:
+    """``(batch, m, n, k)`` for melt — its own flags only; the characterization sizes are not used."""
+    return a.melt_batch_count, a.melt_m, a.melt_n, a.melt_k
+
+
+def _cool_sleep_s(cool_ms: float, reload_elapsed_s: float) -> float:
+    """Sleep needed to stretch a reload of ``reload_elapsed_s`` to the ``cool_ms`` floor.
+
+    On NVLink-C2C a reload takes a few ms against a 140 ms burst; without a
+    floor the duty cycle is ~98 % hot — steady state, not thermal cycling.
+    """
+    return max(0.0, cool_ms / 1000.0 - reload_elapsed_s)
+
+
+def _duty_cycle_pct(burst_ms: float, cool_ms: float, reload_ms: float) -> float:
+    """Share of each cycle spent hot, given the cool gap is the longer of floor and reload."""
+    cool = max(cool_ms, reload_ms)
+    return burst_ms / (burst_ms + cool) * 100.0 if burst_ms + cool > 0 else 0.0
+
+
+def _cool_gap_line(tag: str, path: str, reload_ms: float, cool_ms: float, burst_ms: float) -> str:
+    duty = _duty_cycle_pct(burst_ms, cool_ms, reload_ms)
+    topped_up = reload_ms < cool_ms
+    tail = f"sleep to {cool_ms:g} ms floor" if topped_up else f"no sleep (already past the {cool_ms:g} ms floor)"
+    return f"{tag} Cool gap: {path} reload {reload_ms:.1f} ms + {tail} (duty cycle {duty:.0f}% hot)"
+
+
+def _burst_too_small_warning(ops_per_burst: int, ms_per_matmul: float) -> Optional[str]:
+    """Warn when the calibrated burst cannot heat a die (tiny matrices, launch-bound loop)."""
+    if ms_per_matmul >= MELT_MIN_MS_PER_MATMUL and ops_per_burst <= MELT_MAX_OPS_PER_BURST:
+        return None
+    return (f"burst is {ops_per_burst} matmuls of {ms_per_matmul:.2f} ms — too small to heat the die; "
+            f"increase --melt-m/n/k or --melt-batch-count")
+
+
+class _InPlaceCoolGap:
+    """Cool gap for devices without a real host→device path (CPU, MPS)."""
+    path = "uniform_"
+
+    def __init__(self, A, Bm):
+        self.A, self.Bm = A, Bm
+
+    def reload(self, cycle: int) -> None:
+        self.A.uniform_()
+        self.Bm.uniform_()
+
+    def release(self) -> None:
+        self.A = self.Bm = None
+
+
+class _HostReloadCoolGap:
+    """xkdgemm-faithful cool gap: refill an operand from host memory.
+
+    One pre-generated host copy per operand; cycles alternate which operand is
+    reloaded (A on even, B on odd) so every cycle moves a full matrix over the
+    host→device link.  During the copy the SMs are idle while the copy engines
+    work — that idle gap is the "cool" half of the thermal cycle.  The host
+    footprint is exactly one operand set, ``B·(M·K + K·N)·bytes``; call
+    ``release()`` when done so the pinned memory is returned before the next
+    benchmark.
+    """
+
+    def __init__(self, A, Bm, pin_memory: bool):
+        self.path = "h2d_pinned" if pin_memory else "h2d_pageable"
+        self._targets = [A, Bm]
+        self._host = [self._host_copy_like(A, pin_memory), self._host_copy_like(Bm, pin_memory)]
+
+    @staticmethod
+    def _host_copy_like(t, pin_memory: bool):
+        return torch.rand(t.shape, dtype=t.dtype, pin_memory=pin_memory)
+
+    @property
+    def host_bytes(self) -> int:
+        return sum(h.numel() * h.element_size() for h in self._host)
+
+    def reload(self, cycle: int) -> None:
+        operand = cycle % 2
+        target = self._targets[operand]
+        target.copy_(self._host[operand], non_blocking=True)
+        if target.is_cuda:
+            torch.cuda.synchronize()
+
+    def release(self) -> None:
+        self._host = []
+        self._targets = []
+
+
+def _make_melt_cool_gap(A, Bm, dev, log, tag: str):
+    """Pick the cool-gap strategy for *dev* and log which one is in use."""
+    if dev.type != "cuda":
+        log.info(f"{tag} Cool gap: in-place uniform_() refill ({dev.type} has no host→device path)")
+        return _InPlaceCoolGap(A, Bm)
+    try:
+        gap = _HostReloadCoolGap(A, Bm, pin_memory=True)
+    except RuntimeError as e:
+        log.warning(f"{tag} Could not pin host buffers ({e}); falling back to pageable host memory")
+        gap = _HostReloadCoolGap(A, Bm, pin_memory=False)
+    log.info(f"{tag} Cool gap: host→device reload from {gap.path} buffers, alternating A/B each cycle "
+             f"(host footprint ≈ {gap.host_bytes / 1024**2:.0f} MB; pinned allocator may round up)")
+    return gap
+
+
+def _calibrate_ops_per_burst(A, Bm, dev, burst_ms: float) -> Tuple[int, float]:
+    """``(ops_per_burst, ms_per_matmul)`` so one burst lasts about ``burst_ms``."""
+    samples_ms = []
+    for _ in range(MELT_CALIBRATION_MATMULS):
+        with Timer(dev) as t:
+            torch.matmul(A, Bm)
+        samples_ms.append(t.elapsed * 1e3)
+    ms_per_matmul = statistics.median(samples_ms)
+    if ms_per_matmul <= 0:
+        return 1, ms_per_matmul
+    return max(1, round(burst_ms / ms_per_matmul)), ms_per_matmul
+
+
+def _format_power_range(power_range: Optional[Tuple[float, float]]) -> str:
+    if power_range is None:
+        return "power n/a"
+    return f"power {power_range[0]:.0f}–{power_range[1]:.0f} W"
+
+
+def _format_temp_trend(temp_mean_c: Optional[float], slope_c_per_min: Optional[float]) -> str:
+    """``temp 46.1 °C (−0.2 °C/min)``; the slope is dropped when the rule is skipped."""
+    if temp_mean_c is None:
+        return "temp n/a"
+    if slope_c_per_min is None:
+        return f"temp {temp_mean_c:.1f} °C"
+    signed_slope = f"{slope_c_per_min:+.1f}".replace("-", "−")
+    return f"temp {temp_mean_c:.1f} °C ({signed_slope} °C/min)"
+
+
+def _melt_progress_line(tag: str, elapsed_s: float, max_s: float, cycle_count: int,
+                        info: Dict[str, Any], power_range: Optional[Tuple[float, float]]) -> str:
+    mean = info['window_mean']
+    window = "n/a"
+    if mean is not None:
+        plateau_cv = f"{info['window_cv']:.1f}%" if info['window_cv'] is not None else "n/a"
+        window = f"{mean:,.0f} GFLOP/s, CV {plateau_cv} (cycle {info['cycle_cv_pct']:.1f}%)"
+    best = f"{info['best']:,.0f}" if info['best'] is not None else "n/a"
+    temp = _format_temp_trend(info.get('window_temp_mean_C'), info.get('temp_slope_c_per_min'))
+    return (f"{tag} {elapsed_s / 60:.1f}/{max_s / 60:.1f} min | {cycle_count:,} cycles | window {window} | "
+            f"best {best} | {_format_power_range(power_range)} | {temp} | not settled: {info['reason']}")
+
+
+def _melt_verdict_lines(tag: str, outcome: Dict[str, Any], runtime_s: float) -> List[Tuple[int, str]]:
+    """``(log level, message)`` lines for the end of a melt.
+
+    SETTLED is one INFO line.  NOT SETTLED is a WARNING plus follow-ups:
+    which rule was still blocking when the run stopped, and what to do next.
+    When the *only* blocker was the plateau-CV rule on a flat, throttle-free,
+    at-best window, the diagnosis is measurement noise — the module is not
+    blamed and the "rerun" advice is dropped.
+    """
+    settled = outcome['settled']
+    power = outcome.get('power_min_W'), outcome.get('power_max_W')
+    power_range = None if power[0] is None or power[1] is None else power
+    temp = outcome.get('window_temp_mean_C')
+    headline = (f"{tag} {'SETTLED' if settled else 'NOT SETTLED'} after {_format_melt_duration(runtime_s)} "
+                f"(cycles {outcome['cycles']:,}): {outcome['start_gflops']:,.0f} → {outcome['plateau_gflops']:,.0f} GFLOP/s, "
+                f"{_format_power_range(power_range)}, {'temp n/a' if temp is None else f'temp {temp:.0f} °C'}")
+    before_after = (logging.INFO, _melt_before_after_line(outcome))
+    if settled:
+        return [(logging.INFO, headline), before_after]
+    if _noise_limited(outcome):
+        return [
+            (logging.WARNING, headline),
+            before_after,
+            (logging.WARNING, f"  blocking rule at stop: {outcome['stop_reason']} — performance is flat and "
+                              "throttle-free; this is most likely measurement noise, not TIM. "
+                              "Consider --melt-plateau-cv-pct 2 or a larger --melt-bin-s"),
+        ]
+    last = outcome.get('last_throttle_s')
+    last_text = f"last thermal throttle at {last / 60:.1f} min" if last is not None else "no thermal throttle seen"
+    return [
+        (logging.WARNING, headline),
+        before_after,
+        (logging.WARNING, f"  blocking rule at stop: {outcome.get('stop_reason', 'unknown')}; {last_text}; "
+                          f"{outcome['thermal_throttle_cycles']} throttled cycles total"),
+        (logging.WARNING, "  next: rerun --melt once; a second NOT SETTLED points at the module "
+                          "(TIM / cold plate / coolant), not the tool"),
+    ]
+
+
+def _typographic_sign(value: float, fmt: str) -> str:
+    """``+0.7`` / ``−8.8`` — a real minus sign, as in the progress line."""
+    return format(value, fmt).replace("-", "−")
+
+
+def _melt_before_after_line(outcome: Dict[str, Any]) -> str:
+    """``  start → end: temp 67.7 → 58.9 °C (−8.8 at 423 W) | 52,154 → 52,521 GFLOP/s (+0.7%) | thermal throttle 18 → 0 cycles``
+
+    Start is the first window of the run, end the last; power is the run
+    mean.  This is the dose's effect in one line, whatever the verdict.
+    """
+    start_temp, end_temp, power = outcome.get('start_temp_C'), outcome.get('end_temp_C'), outcome.get('power_mean_W')
+    if start_temp is None or end_temp is None:
+        temp = "temp n/a"
+    else:
+        at_power = f" at {power:.0f} W" if power is not None else ""
+        temp = f"temp {start_temp:.1f} → {end_temp:.1f} °C ({_typographic_sign(end_temp - start_temp, '+.1f')}{at_power})"
+    start_gflops, end_gflops = outcome['start_gflops'], outcome['plateau_gflops']
+    change_pct = (end_gflops - start_gflops) / start_gflops * 100.0 if start_gflops else 0.0
+    return (f"  start → end: {temp} | {start_gflops:,.0f} → {end_gflops:,.0f} GFLOP/s "
+            f"({_typographic_sign(change_pct, '+.1f')}%) | "
+            f"thermal throttle {outcome['start_throttle_cycles']} → {outcome['end_throttle_cycles']} cycles")
+
+
+def _noise_limited(outcome: Dict[str, Any]) -> bool:
+    """Only the plateau-CV rule failed at stop and the run never throttled."""
+    return outcome.get('stop_rules_failed') == ['plateau_cv'] and not outcome.get('thermal_throttle_cycles')
+
+
+def _leading_window(records: List[MeltCycle], window_s: float) -> List[MeltCycle]:
+    """Cycles of the first ``window_s`` seconds (the cold, possibly throttled start)."""
+    t0 = records[0].t_s
+    return [r for r in records if r.t_s <= t0 + window_s]
+
+
+def _last_window(records: List[MeltCycle], window_s: float) -> List[MeltCycle]:
+    """Cycles of the last ``window_s`` seconds (the plateau, if settled)."""
+    return _trailing_window(records, records[-1].t_s, window_s)
+
+
+def _mean_gflops(window: List[MeltCycle]) -> float:
+    return statistics.mean(r.gflops for r in window)
+
+
+def _mean_or_none(values: List[Optional[float]]) -> Optional[float]:
+    present = [v for v in values if v is not None]
+    return statistics.mean(present) if present else None
+
+
+def _throttled_cycles(window: List[MeltCycle]) -> int:
+    return sum(1 for r in window if r.thermal_throttled)
+
+
+def _window_power_range(window: List[MeltCycle]) -> Optional[Tuple[float, float]]:
+    """``(trough, peak)`` W over the window's cycles, or None without power telemetry."""
+    lows = [r.power_min_W for r in window if r.power_min_W is not None]
+    highs = [r.power_max_W for r in window if r.power_max_W is not None]
+    if not lows or not highs:
+        return None
+    return min(lows), max(highs)
+
+
+def _trailing_window_power_range(records: List[MeltCycle], window_s: float) -> Optional[Tuple[float, float]]:
+    return _window_power_range(_last_window(records, window_s)) if records else None
+
+
+def _attach_melt_trajectory(perf: Dict[str, Any], records: List[MeltCycle]) -> None:
+    """Add per-cycle power trough/peak, mean temperature and the thermal flag to iteration_telemetry."""
+    for entry in perf.get('iteration_telemetry', []):
+        cycle = records[entry['iteration']]
+        entry['power_min_W'] = cycle.power_min_W
+        entry['power_max_W'] = cycle.power_max_W
+        entry['temp_mean_C'] = cycle.temp_mean_C
+        entry['thermal_throttled'] = cycle.thermal_throttled
+
+
+class _MeltWorkload:
+    """Everything one heat/cool cycle needs: operands, the cool gap and the burst size.
+
+    Mutable on purpose: ``release()`` drops the operand references so the
+    device memory can really be returned before the next benchmark starts.
+    """
+
+    def __init__(self, A, Bm, cool_gap, ops_per_burst: int, ms_per_matmul: float, dtype_str: str):
+        self.A, self.Bm, self.cool_gap = A, Bm, cool_gap
+        self.ops_per_burst, self.ms_per_matmul, self.dtype_str = ops_per_burst, ms_per_matmul, dtype_str
+        B, M, K = A.shape
+        N = Bm.shape[2]
+        self.dims = (B, M, N, K)
+        self.flops_per_burst = 2 * B * M * N * K * ops_per_burst
+
+    @property
+    def burst_ms_measured(self) -> float:
+        return self.ops_per_burst * self.ms_per_matmul
+
+    def burst(self) -> None:
+        for _ in range(self.ops_per_burst):
+            torch.matmul(self.A, self.Bm)
+
+    def release(self) -> None:
+        self.cool_gap.release()
+        self.A = self.Bm = None
+
+
+class _MeltRun(NamedTuple):
+    records: List[MeltCycle]
+    settled: bool
+    settle_s: Optional[float]
+    stop_info: Dict[str, Any]   # the melt_converged info at the last evaluation
+
+
+def _timed_cool_gap(cool_gap, cycle: int, cool_ms: float) -> float:
+    """Reload (SMs idle), then sleep up to the ``cool_ms`` floor; returns the reload time in ms."""
+    reload_start = time.perf_counter()
+    cool_gap.reload(cycle)
+    reload_elapsed_s = time.perf_counter() - reload_start
+    sleep_s = _cool_sleep_s(cool_ms, reload_elapsed_s)
+    if sleep_s > 0:
+        time.sleep(sleep_s)
+    return reload_elapsed_s * 1e3
+
+
+def _median_reload_ms(records: List[MeltCycle]) -> float:
+    return statistics.median(r.reload_ms for r in records) if records else 0.0
+
+
+def _run_melt_cycles(a, dev, log, tel_thread, prn, workload: _MeltWorkload, tag: str) -> _MeltRun:
+    """Heat/cool until settled or ``--melt-max-duration``.
+
+    The rules are evaluated on every cycle past the gate *before* the hard
+    stop is checked, so a fixed dose (min == max) ends with the verdict of
+    the rules on the final window, not with an automatic NOT SETTLED.
+
+    The telemetry window of a cycle spans burst *and* cool gap (``mark_iteration_end``
+    comes after the reload and sleep) so the per-cycle ``power_min_W`` is the
+    trough of the thermal cycle, not the minimum during the hot burst.  The
+    GFLOPS timer wraps the burst only.
+    """
+    records: List[MeltCycle] = []
+    tracker = _ConvergenceTracker.from_args(a)
+    settled, settle_s = False, None
+    info: Dict[str, Any] = {'reason': 'no cycle completed', 'rules_failed': [], 'window_cv': None, 'cycle_cv_pct': None,
+                            'temp_slope_c_per_min': None, 'window_temp_mean_C': None}
+    cool_gap_logged = False
+    start = time.perf_counter()
+    next_progress = start + MELT_PROGRESS_INTERVAL_S
+    cycle = 0
+    while True:
+        tel_thread.mark_iteration_start(cycle)
+        with Timer(dev) as t:
+            workload.burst()                                              # HOT
+        reload_ms = _timed_cool_gap(workload.cool_gap, cycle, a.melt_cool_ms)  # COOL
+        tel_thread.mark_iteration_end(cycle)
+        val = gflops(workload.flops_per_burst, t.elapsed)
+        cycle_tel = _melt_cycle_telemetry(tel_thread, cycle)
+        elapsed = time.perf_counter() - start
+        records.append(MeltCycle(elapsed, val, cycle_tel.thermal_throttled,
+                                 temp_mean_C=cycle_tel.temp_mean_C, temp_max_C=cycle_tel.temp_max_C,
+                                 power_min_W=cycle_tel.power_min_W, power_max_W=cycle_tel.power_max_W,
+                                 reload_ms=reload_ms, power_mean_W=cycle_tel.power_mean_W))
+        if a.verbose:
+            prn.emit(cycle, "melt", workload.dtype_str, "gflops", val, tel_thread.get_iteration_telemetry(cycle))
+        if not cool_gap_logged and len(records) >= MELT_RELOAD_SAMPLE_CYCLES:
+            log.info(_cool_gap_line(tag, workload.cool_gap.path, _median_reload_ms(records),
+                                    a.melt_cool_ms, workload.burst_ms_measured))
+            cool_gap_logged = True
+
+        settled, info = tracker.update(records, elapsed)
+        if settled:
+            settle_s = elapsed
+            break
+        if elapsed >= a.melt_max_duration:
+            break
+        if time.perf_counter() >= next_progress:
+            log.info(_melt_progress_line(tag, elapsed, a.melt_max_duration, len(records), info,
+                                         _trailing_window_power_range(records, a.melt_window_s)))
+            next_progress += MELT_PROGRESS_INTERVAL_S
+        cycle += 1
+    if not cool_gap_logged:
+        log.info(_cool_gap_line(tag, workload.cool_gap.path, _median_reload_ms(records),
+                                a.melt_cool_ms, workload.burst_ms_measured))
+    return _MeltRun(records, settled, settle_s, info)
+
+
+def _prepare_melt_workload(a, dev, log, tag: str) -> _MeltWorkload:
+    """Allocate operands, choose the cool gap, warm up and calibrate the burst."""
+    dtype = getattr(torch, a.precision_melt)
+    dtype_str = str(dtype).split(".")[-1]
+    B, M, N, K = _melt_dims(a)
+
+    log.info(f"{tag} Allocating tensors ({B}x{M}x{K} + {B}x{K}x{N}, {dtype_str})...")
+    A = torch.rand(B, M, K, device=dev, dtype=dtype)
+    Bm = torch.rand(B, K, N, device=dev, dtype=dtype)
+    cool_gap = _make_melt_cool_gap(A, Bm, dev, log, tag)
+
+    log.info(f"{tag} Warmup ({a.warmup} iterations)...")
+    for _ in range(a.warmup):
+        torch.matmul(A, Bm)
+    ops_per_burst, ms_per_matmul = _calibrate_ops_per_burst(A, Bm, dev, a.melt_burst_ms)
+    log.info(f"{tag} Calibrated burst ≈ {ops_per_burst * ms_per_matmul:.1f} ms = {ops_per_burst} matmuls "
+             f"({ms_per_matmul:.2f} ms each, target {a.melt_burst_ms:g} ms)")
+    too_small = _burst_too_small_warning(ops_per_burst, ms_per_matmul)
+    if too_small:
+        log.warning(f"{tag} {too_small}")
+    return _MeltWorkload(A, Bm, cool_gap, ops_per_burst, ms_per_matmul, dtype_str)
+
+
+def _melt_params(a, workload: _MeltWorkload) -> Dict[str, Any]:
+    B, M, N, K = workload.dims
+    return {
+        'dtype': workload.dtype_str, 'batch': B, 'm': M, 'n': N, 'k': K,
+        'burst_ms': a.melt_burst_ms, 'cool_ms': a.melt_cool_ms,
+        'window_s': a.melt_window_s, 'bin_s': a.melt_bin_s, 'min_duration': a.melt_min_duration,
+        'max_duration': a.melt_max_duration, 'plateau_cv_pct': a.melt_plateau_cv_pct,
+        'settled_pct': a.melt_settled_pct, 'target_gflops': a.melt_target_gflops,
+        'temp_slope_c_per_min': a.melt_temp_slope_c_per_min, 'temp_window_s': a.melt_temp_window_s,
+        'temp_sibling_warn_c': a.melt_temp_sibling_warn_c,
+    }
+
+
+def _melt_outcome_fields(run: _MeltRun, workload: _MeltWorkload, window_s: float, cool_ms: float) -> Dict[str, Any]:
+    """The ``MELT_RESULT_FIELDS`` added on top of the ``_log_summary`` dict."""
+    records = run.records
+    throttled_cycles = [r for r in records if r.thermal_throttled]
+    reload_ms = _median_reload_ms(records)
+    power_range = _trailing_window_power_range(records, window_s)
+    start, end = _leading_window(records, window_s), _last_window(records, window_s)
+    return {
+        'settled': run.settled,
+        'settle_s': round(run.settle_s, 3) if run.settle_s is not None else None,
+        'cycles': len(records),
+        'start_gflops': _mean_gflops(start),
+        'plateau_gflops': _mean_gflops(end),
+        'start_temp_C': _round_or_none(_mean_or_none([r.temp_mean_C for r in start]), 1),
+        'end_temp_C': _round_or_none(_mean_or_none([r.temp_mean_C for r in end]), 1),
+        'start_throttle_cycles': _throttled_cycles(start),
+        'end_throttle_cycles': _throttled_cycles(end),
+        'power_mean_W': _round_or_none(_mean_or_none([r.power_mean_W for r in records]), 1),
+        'thermal_throttle_cycles': len(throttled_cycles),
+        'last_throttle_s': round(throttled_cycles[-1].t_s, 3) if throttled_cycles else None,
+        'ops_per_burst': workload.ops_per_burst,
+        'burst_ms_measured': workload.burst_ms_measured,
+        'reload_path': workload.cool_gap.path,
+        'reload_ms_measured': round(reload_ms, 3),
+        'duty_cycle_pct': round(_duty_cycle_pct(workload.burst_ms_measured, cool_ms, reload_ms), 1),
+        'power_min_W': power_range[0] if power_range else None,
+        'power_max_W': power_range[1] if power_range else None,
+        'stop_reason': run.stop_info['reason'],
+        'stop_rules_failed': list(run.stop_info['rules_failed']),
+        'plateau_cv_pct': _round_or_none(run.stop_info.get('window_cv')),
+        'cycle_cv_pct': _round_or_none(run.stop_info.get('cycle_cv_pct')),
+        'temp_slope_c_per_min': _round_or_none(run.stop_info.get('temp_slope_c_per_min')),
+        'window_temp_mean_C': _round_or_none(run.stop_info.get('window_temp_mean_C'), 1),
+        'temp_mean_C': _round_or_none(_run_temp_mean(records), 1),
+        'temp_max_C': _run_temp_max(records),
+        'temp_sibling_delta_C': None,   # filled in by the multi-GPU parent, see _melt_sibling_temp_warnings
+    }
+
+
+def _run_temp_mean(records: List[MeltCycle]) -> Optional[float]:
+    return _mean_or_none([r.temp_mean_C for r in records])
+
+
+def _run_temp_max(records: List[MeltCycle]) -> Optional[float]:
+    temps = [r.temp_max_C for r in records if r.temp_max_C is not None]
+    return max(temps) if temps else None
+
+
+def _round_or_none(value: Optional[float], digits: int = 3) -> Optional[float]:
+    return round(value, digits) if value is not None else None
+
+
+def melt_test(a, dev, log, tel, tel_thread, prn):
+    """Melt mode: thermal-cycle a GPU with GEMM bursts until its TIM has settled.
+
+    Follows the benchmark contract and reuses ``_log_summary``; the returned
+    dict additionally carries ``MELT_RESULT_FIELDS`` (``settled``,
+    ``settle_s``, ...) and per-cycle power/throttle data in
+    ``iteration_telemetry``.
+    """
+    gpu_id = tel_thread.get_latest().get('device_id', '?')
+    tag = f"[{device_label(dev, gpu_id)} {MELT_BENCHMARK_NAME}]"
+    workload = None
+    try:
+        workload = _prepare_melt_workload(a, dev, log, tag)
+        log.info(f"{tag} Cycling until settled (window {a.melt_window_s:g} s in {a.melt_bin_s:g} s bins, "
+                 f"plateau CV ≤ {a.melt_plateau_cv_pct:g}%, "
+                 f"≥ {a.melt_settled_pct:g}% of best, {_temp_rule_summary(a)}, "
+                 f"min {a.melt_min_duration:g} s, max {a.melt_max_duration:g} s)...")
+
+        tel_thread.clear_iteration_samples()
+        tel_thread.set_active(True)
+        start_time = time.perf_counter()
+        run = _run_melt_cycles(a, dev, log, tel_thread, prn, workload, tag)
+        runtime_s = time.perf_counter() - start_time
+        tel_thread.set_active(False)
+
+        if hasattr(tel, 'check_thermal_warnings'):
+            tel.check_thermal_warnings(log, a.temp_warn_C, a.temp_critical_C, a.power_warn_pct)
+
+        outcome = _melt_outcome_fields(run, workload, a.melt_window_s, a.melt_cool_ms)
+        for level, line in _melt_verdict_lines(tag, outcome, runtime_s):
+            log.log(level, line)
+
+        baselines = getattr(a, '_hardware_baselines', None)
+        perf = _log_summary(MELT_BENCHMARK_NAME, [r.gflops for r in run.records], "GFLOP/s", log, tel, dev,
+                            _melt_params(a, workload), baselines, verbose=a.verbose,
+                            skip_telemetry=a.skip_telemetry_first_n, tel_thread=tel_thread, runtime_s=runtime_s)
+        perf.update(outcome)
+        _attach_melt_trajectory(perf, run.records)
+        tel_thread.clear_iteration_samples()   # no melt samples bleed into the next benchmark
+        return perf
+    except Exception as e:
+        log.error(f"{tag} Failed: {e}")
+        import traceback
+        log.error(f"{tag} Traceback: {traceback.format_exc()}")
+        return None
+    finally:
+        _release_melt_workload(workload, dev)
+
+
+def _release_melt_workload(workload: Optional[_MeltWorkload], dev) -> None:
+    """Drop the operands and the (possibly pinned) host mirror, then return cached device memory.
+
+    ``workload.release()`` clears the tensor references held by the workload
+    itself (the caller keeps only the workload object), so ``empty_cache()``
+    really can hand the blocks back before the next benchmark allocates.
+    """
+    if workload is None:
+        return
+    workload.release()
+    if dev.type == "cuda":
+        torch.cuda.empty_cache()
 
 
 def convolution_test(a, dev, log, tel, tel_thread, prn):
@@ -3392,6 +4522,35 @@ def _config_get(bench_config, *keys, default=None):
     return default
 
 
+# YAML ``name: melt`` keys (without the melt_ prefix) -> args attribute
+_MELT_CONFIG_KEYS = {
+    'precision': 'precision_melt',
+    'm': 'melt_m',
+    'n': 'melt_n',
+    'k': 'melt_k',
+    'batch_count': 'melt_batch_count',
+    'burst_ms': 'melt_burst_ms',
+    'cool_ms': 'melt_cool_ms',
+    'max_duration': 'melt_max_duration',
+    'min_duration': 'melt_min_duration',
+    'window_s': 'melt_window_s',
+    'bin_s': 'melt_bin_s',
+    'plateau_cv_pct': 'melt_plateau_cv_pct',
+    'settled_pct': 'melt_settled_pct',
+    'target_gflops': 'melt_target_gflops',
+    'temp_slope_c_per_min': 'melt_temp_slope_c_per_min',
+    'temp_window_s': 'melt_temp_window_s',
+    'temp_sibling_warn_c': 'melt_temp_sibling_warn_c',
+}
+
+
+def _apply_melt_config(args, bench_config):
+    """Copy a ``name: melt`` entry onto args; short keys and full attribute names both work."""
+    for short_key, attr_name in _MELT_CONFIG_KEYS.items():
+        setattr(args, attr_name, _config_get(bench_config, short_key, attr_name,
+                                             default=getattr(args, attr_name)))
+
+
 @functools.lru_cache(maxsize=None)
 def _reference_parser():
     """A parser built once, used only to introspect flag definitions and defaults."""
@@ -3479,6 +4638,24 @@ def _apply_runtime_setting(args, arg_name, value, cli_args_set):
         setattr(args, arg_name, value)
 
 
+def _melt_first(benchmark_list, melt_flag):
+    """Return ``(ordered_list, changed)`` with the melt entry first.
+
+    Melt (TIM settling) must precede characterization so the GPU is settled
+    before anything is measured.  A ``name: melt`` entry found later in the
+    list is hoisted; ``--melt`` / ``global: melt: true`` without an entry
+    injects a default one.  ``changed`` tells the caller to log the reorder.
+    """
+    melt_entries = [b for b in benchmark_list if b.get('name') == 'melt']
+    others = [b for b in benchmark_list if b.get('name') != 'melt']
+    if not melt_entries:
+        if not melt_flag:
+            return list(benchmark_list), False
+        return [{'name': 'melt'}] + others, True
+    ordered = melt_entries + others
+    return ordered, ordered != list(benchmark_list)
+
+
 def apply_config_to_args(args, config):
     """Apply configuration file settings to args namespace. CLI args take precedence."""
     if not config:
@@ -3524,7 +4701,7 @@ def apply_config_to_args(args, config):
     # Store benchmark list for multiple invocations
     benchmarks = config.get('benchmarks', [])
     benchmark_list = []
-    valid_benchmark_names = {'batched_gemm', 'convolution', 'fft', 'einsum', 'memory_traffic', 'heat_equation', 'schrodinger', 'atomic_contention', 'sparse_mm'}
+    valid_benchmark_names = {'batched_gemm', 'convolution', 'fft', 'einsum', 'memory_traffic', 'heat_equation', 'schrodinger', 'atomic_contention', 'sparse_mm', 'melt'}
     
     for idx, bench_config in enumerate(benchmarks):
         if not bench_config.get('enabled', True):
@@ -3690,7 +4867,93 @@ def build_parser():
     p.add_argument("--sparse-density", type=float, default=0.10, help="Sparse matrix density (0.10 = 10%% non-zeros, higher = more stress)")
     p.add_argument("--inner-loop-sparse", type=int, default=50)
     p.add_argument("--precision-sparse", default="float32", choices=["float16", "bfloat16", "float32", "float64"])
+    melt = p.add_argument_group("melt mode (TIM settling)")
+    melt.add_argument("--melt", "--tim-settle", dest="melt", action="store_true",
+                      help="Run melt (TIM settling) before the selected benchmarks: GEMM bursts alternating with idle gaps "
+                           "for a fixed duration, then a SETTLED or NOT SETTLED verdict per GPU")
+    melt.add_argument("--melt-only", action="store_true", help="Run melt and skip all other benchmarks (implies --melt)")
+    melt.add_argument("--precision-melt", default="float32", choices=["float16", "bfloat16", "float32", "float64"],
+                      help="Data type (default: %(default)s); use float64 on data-center GPUs")
+    melt.add_argument("--melt-m", type=int, default=MELT_MNK, help="Matrix dimension M (default: %(default)s; independent of --m)")
+    melt.add_argument("--melt-n", type=int, default=MELT_MNK, help="Matrix dimension N (default: %(default)s; independent of --n)")
+    melt.add_argument("--melt-k", type=int, default=MELT_MNK, help="Matrix dimension K (default: %(default)s; independent of --k)")
+    melt.add_argument("--melt-batch-count", type=int, default=MELT_BATCH,
+                      help="Number of matrices per batch (default: %(default)s; independent of --batch-count-gemm)")
+    melt.add_argument("--melt-burst-ms", type=float, default=MELT_BURST_MS,
+                      help="Target duration of each GEMM burst, in ms (default: %(default)s)")
+    melt.add_argument("--melt-cool-ms", type=float, default=MELT_COOL_MS,
+                      help="Minimum duration of each cool gap, in ms (default: %(default)s)")
+    melt.add_argument("--melt-max-duration", type=float, default=MELT_MAX_DURATION_S,
+                      help=f"Total melt duration, in s (default: %(default).0f = {MELT_MAX_DURATION_S / 60:.0f} min)")
+    melt.add_argument("--melt-min-duration", type=float, default=MELT_MIN_DURATION_S,
+                      help=f"Earliest time at which a GPU can be declared SETTLED, in s "
+                           f"(default: %(default).0f = {MELT_MIN_DURATION_S / 60:.0f} min); "
+                           "set to 300 to re-check a module that has already been melted")
+    melt.add_argument("--melt-window-s", type=float, default=MELT_WINDOW_S,
+                      help="Length of the evaluation window at the end of the run, in s (default: %(default)s)")
+    melt.add_argument("--melt-bin-s", type=float, default=MELT_BIN_S,
+                      help="Averaging interval within the window, in s; the window must contain at least 3 intervals (default: %(default)s)")
+    melt.add_argument("--melt-plateau-cv-pct", type=float, default=MELT_PLATEAU_CV_PCT,
+                      help="Maximum coefficient of variation of the interval-mean GFLOP/s, in %% (default: %(default)s)")
+    melt.add_argument("--melt-settled-pct", type=float, default=MELT_SETTLED_PCT,
+                      help="Minimum window mean, as a percentage of the best window mean so far; applies only when "
+                           "--melt-min-duration is shorter than --melt-max-duration (default: %(default)s)")
+    melt.add_argument("--melt-target-gflops", type=float, default=None,
+                      help="Minimum window mean, in GFLOP/s; not applied unless set")
+    melt.add_argument("--melt-temp-slope-c-per-min", type=float, default=MELT_TEMP_SLOPE_C_PER_MIN,
+                      help="Maximum rate of temperature change, in °C/min; 0 disables the rule (default: %(default)s)")
+    melt.add_argument("--melt-temp-window-s", type=float, default=MELT_TEMP_WINDOW_S,
+                      help="Window over which the rate of temperature change is measured, in s (default: %(default).0f)")
+    melt.add_argument("--melt-temp-sibling-warn-c", type=float, default=MELT_TEMP_SIBLING_WARN_C,
+                      help="Multi-GPU runs: temperature excess over sibling GPUs at equal power "
+                           f"(within {MELT_SIBLING_POWER_TOLERANCE_PCT:g}%%) that triggers a warning, in °C; "
+                           "0 disables the warning (default: %(default)s)")
     return p
+
+
+def _validate_melt_args(parser, args, log) -> None:
+    """Reject contradictory melt flags before any GPU work starts.
+
+    ``parser.error`` exits with the offending values; soft problems (a window
+    that reaches into the min-duration gate, an inapplicable ``--duration``)
+    are logged and the run proceeds.
+    """
+    if args.melt_only and not args.melt:
+        args.melt = True
+        log.info("--melt-only implies --melt")
+    if not args.melt:
+        return
+    for flag, value in (("--melt-window-s", args.melt_window_s), ("--melt-burst-ms", args.melt_burst_ms),
+                        ("--melt-max-duration", args.melt_max_duration)):
+        if value <= 0:
+            parser.error(f"{flag} must be > 0 (got {value:g})")
+    if args.melt_min_duration > args.melt_max_duration:
+        parser.error(f"--melt-min-duration ({args.melt_min_duration:g} s) must not exceed "
+                     f"--melt-max-duration ({args.melt_max_duration:g} s)")
+    if args.melt_cool_ms < 0:
+        parser.error(f"--melt-cool-ms must be >= 0 (got {args.melt_cool_ms:g})")
+    if not 0 < args.melt_settled_pct <= 100:
+        parser.error(f"--melt-settled-pct must be in (0, 100] (got {args.melt_settled_pct:g})")
+    for flag, value in (("--melt-plateau-cv-pct", args.melt_plateau_cv_pct),
+                        ("--melt-temp-slope-c-per-min", args.melt_temp_slope_c_per_min),
+                        ("--melt-temp-sibling-warn-c", args.melt_temp_sibling_warn_c)):
+        if value < 0:
+            parser.error(f"{flag} must be >= 0 (got {value:g})")
+    if args.melt_temp_window_s <= 0:
+        parser.error(f"--melt-temp-window-s must be > 0 (got {args.melt_temp_window_s:g})")
+    if args.melt_temp_window_s < args.melt_window_s:
+        args.melt_temp_window_s = args.melt_window_s
+        log.info(f"--melt-temp-window-s raised to {args.melt_window_s:g} s to cover --melt-window-s")
+    if args.melt_bin_s <= 0:
+        parser.error(f"--melt-bin-s must be > 0 (got {args.melt_bin_s:g})")
+    if _bins_in_window(args.melt_window_s, args.melt_bin_s) < MELT_MIN_BINS:
+        parser.error(f"--melt-bin-s ({args.melt_bin_s:g} s) must fit {MELT_MIN_BINS} times into "
+                     f"--melt-window-s ({args.melt_window_s:g} s)")
+    if args.melt_window_s > args.melt_min_duration:
+        log.warning(f"--melt-window-s ({args.melt_window_s:g} s) is longer than --melt-min-duration "
+                    f"({args.melt_min_duration:g} s): window extends before the min-duration gate")
+    if args.duration is not None:
+        log.info("--duration does not apply to melt; use --melt-max-duration")
 
 def init_logging(a, gpu_index=None, tel_data=None):
     """Set up logging. Returns logger.
@@ -3930,11 +5193,11 @@ def run_single_gpu(args, gpu_index: int, log=None):
     benchmarks_selected = any([
         args.batched_gemm, args.convolution, args.fft, args.einsum,
         args.memory_traffic, args.heat_equation, args.schrodinger,
-        args.atomic_contention, args.sparse_mm
+        args.atomic_contention, args.sparse_mm, args.melt
     ]) or (hasattr(args, 'benchmark_list') and args.benchmark_list)
     
     if not benchmarks_selected:
-        log.warning("No benchmarks selected. Use --batched-gemm, --convolution, --fft, --einsum, --memory-traffic, --heat-equation, --schrodinger, --atomic-contention, or --sparse-mm")
+        log.warning("No benchmarks selected. Use --batched-gemm, --convolution, --fft, --einsum, --memory-traffic, --heat-equation, --schrodinger, --atomic-contention, --sparse-mm, or --melt")
         return
     
     # If duration is specified without max_iterations, allow unlimited iterations
@@ -3967,6 +5230,8 @@ def run_single_gpu(args, gpu_index: int, log=None):
             apply_stress_params(args, "atomic", available_mb, log)
         if args.sparse_mm:
             apply_stress_params(args, "sparse", available_mb, log)
+        if args.melt:
+            apply_stress_params(args, "melt", available_mb, log)
     
     # Dry-run mode: show configuration and exit
     if args.dry_run:
@@ -3978,6 +5243,8 @@ def run_single_gpu(args, gpu_index: int, log=None):
             log.info(f"Total Memory: {tel_data.get('mem_total_MB', 'N/A')} MB")
         
         selected = []
+        if args.melt:
+            selected.append(_melt_dry_run_line(args))
         if args.batched_gemm:
             tensor_mb = (args.batch_count_gemm * args.m * args.k + args.batch_count_gemm * args.k * args.n) * 4 / 1024**2
             selected.append(f"  - Batched GEMM: {args.batch_count_gemm}x{args.m}x{args.n}x{args.k} ({args.precision_gemm}) ~{tensor_mb:.1f}MB")
@@ -4008,7 +5275,7 @@ def run_single_gpu(args, gpu_index: int, log=None):
             selected.append(f"  - Sparse MM: {args.sparse_m}x{args.sparse_k} @ {args.sparse_density*100:.1f}% ({nnz} nnz) ~{tensor_mb:.1f}MB")
         
         log.info("Selected Benchmarks:")
-        for s in selected:
+        for s in _annotate_dry_run_skips(selected, args.melt_only):
             log.info(s)
         log.info("=== END DRY RUN ===")
         tel.shutdown()
@@ -4109,6 +5376,9 @@ def run_single_gpu(args, gpu_index: int, log=None):
             if args.shuffle:
                 random.shuffle(benchmark_list)
                 log.info(f"Shuffled benchmark execution order")
+            benchmark_list, melt_hoisted = _melt_first(benchmark_list, args.melt)
+            if melt_hoisted:
+                log.info("Melt (TIM settling) moved to the front: it always runs before other benchmarks")
             
             log.info(f"Running {len(benchmark_list)} benchmark(s) from config file:")
             for idx, bench_config in enumerate(benchmark_list):
@@ -4124,6 +5394,7 @@ def run_single_gpu(args, gpu_index: int, log=None):
                     'schrodinger': ('precision', 'precision_schrodinger'),
                     'atomic_contention': ('precision', 'precision_atomic'),
                     'sparse_mm': ('precision', 'precision_sparse'),
+                    'melt': ('precision', 'precision_melt'),
                 }
                 precision = _config_get(bench_config, *_prec_keys.get(bench_name, ('precision',)), default='default')
                 log.info(f"  {idx+1}. {bench_name} ({precision})")
@@ -4136,7 +5407,26 @@ def run_single_gpu(args, gpu_index: int, log=None):
                 original_values = {}
                 
                 # Apply benchmark-specific parameters
-                if bench_name == 'batched_gemm':
+                if bench_name == 'melt':
+                    for attr_name in _MELT_CONFIG_KEYS.values():
+                        original_values[attr_name] = getattr(args, attr_name)
+                    _apply_melt_config(args, bench_config)
+                    if args.stress_test:
+                        apply_stress_params(args, "melt", available_mb, log)
+                    
+                    # Reset telemetry stats before benchmark for per-benchmark isolation
+                    tel.reset_stats()
+                    perf = melt_test(args, dev, log, tel, tel_thread, prn)
+                    
+                    # Free GPU memory
+                    if dev.type == "cuda":
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                    
+                    if perf:
+                        benchmark_results.append(perf)
+                
+                elif bench_name == 'batched_gemm':
                     original_values['precision_gemm'] = args.precision_gemm
                     original_values['batch_count_gemm'] = args.batch_count_gemm
                     original_values['m'] = args.m
@@ -4400,7 +5690,7 @@ def run_single_gpu(args, gpu_index: int, log=None):
                 
                 else:
                     # Unknown benchmark name in config file
-                    log.warning(f"Unknown benchmark name '{bench_name}' in config file (benchmark #{idx+1}). Valid names: batched_gemm, convolution, fft, einsum, memory_traffic, heat_equation, schrodinger, atomic_contention, sparse_mm")
+                    log.warning(f"Unknown benchmark name '{bench_name}' in config file (benchmark #{idx+1}). Valid names: batched_gemm, convolution, fft, einsum, memory_traffic, heat_equation, schrodinger, atomic_contention, sparse_mm, melt")
                     continue
                 
                 # Emit compact CSV row (if --compact) before restoring params
@@ -4410,9 +5700,23 @@ def run_single_gpu(args, gpu_index: int, log=None):
                 # Restore original values after each benchmark
                 for key, value in original_values.items():
                     setattr(args, key, value)
+                
+                if bench_name == 'melt' and args.melt_only and idx + 1 < len(benchmark_list):
+                    log.info(f"--melt-only: skipping the remaining {len(benchmark_list) - idx - 1} benchmark(s)")
+                    break
     
         else:
             # Run benchmarks based on CLI flags (original behavior)
+            # Melt (TIM settling) always runs first so later measurements see a settled GPU
+            if args.melt:
+                tel.reset_stats()  # Per-benchmark telemetry isolation
+                perf = melt_test(args, dev, log, tel, tel_thread, prn)
+                _maybe_emit_compact(perf)
+                _maybe_emit_syslog(perf)
+                benchmark_results.append(perf) if perf else None
+                if args.melt_only:
+                    log.info("--melt-only: skipping all other selected benchmarks")
+                    continue
             if args.batched_gemm:
                 tel.reset_stats()  # Per-benchmark telemetry isolation
                 perf = batched_gemm_test(args, dev, log, tel, tel_thread, prn)
@@ -4480,7 +5784,7 @@ def run_single_gpu(args, gpu_index: int, log=None):
         log.info(f"Final telemetry: {_format_telemetry_compact(tel_data)}")
         tel.shutdown()
         log.info("="*80)
-        log.info(f"[OK] Benchmark run finished on {dev_label}")
+        log.info(_run_closing_line(dev_label, benchmark_results))
         log.info("="*80)
     else:
         # In verbose mode, show throttle summary only for THERMAL throttling
@@ -4613,6 +5917,7 @@ def main():
         sys.exit(0)
     
     log = init_logging(args)
+    _validate_melt_args(_parser, args, log)   # after the config is applied and logging is up
 
     if args.csv_output and args.csv_output == args.summary_csv:
         log.warning("--csv-output and --summary-csv point at the same path; "
@@ -4785,6 +6090,11 @@ def main():
                 _mg_dmesg_writer.close()
             _mg_syslog_reporter.close()
     
+    # A GPU much hotter than equal-power siblings has a thermal-path problem even if it settled.
+    # Annotated before the table/JSON are built; printed after the table, where the operator looks.
+    sibling_temp_warnings = _melt_sibling_temp_warnings(results, _melt_sibling_warn_threshold(results, args))
+    _annotate_sibling_temp_deltas(results, sibling_temp_warnings)
+
     # Display unified multi-GPU summary (skip in compact mode — CSV rows already emitted)
     if len(results) > 1 and not getattr(args, 'compact', False):
         log.info("")
@@ -4986,8 +6296,15 @@ def main():
                     log.info("")
                     log.info(f"Aggregate: {aggregate:.1f} {group['unit']} across {unique_gpus} GPUs | Variation: CV={cv:.1f}%")
         
+        for warning in sibling_temp_warnings:
+            log.warning(warning.message)
+
         log.info("")
         log.info("="*80)
+        melt_closing = _multi_gpu_melt_closing_line(results)
+        if melt_closing:
+            log.info(melt_closing)
+            log.info("="*80)
     
     # Export the summary CSV on single- and multi-GPU runs alike
     if args.summary_csv and results:
@@ -5058,6 +6375,7 @@ def export_json_results(results, args, log):
                         "iteration_telemetry": bench.get('iteration_telemetry', []),
                         "validation": bench.get('validation', {}),
                     }
+                    bench_data.update({k: bench[k] for k in MELT_RESULT_FIELDS if k in bench})
                     gpu_data["benchmarks"].append(bench_data)
             
             export_data["gpus"].append(gpu_data)

@@ -56,6 +56,7 @@ jobs:
           - schrodinger       # 12 tests (6 precisions × 2 potentials)
           - atomic            #  4 tests
           - sparse            #  2 tests
+          - melt              #  1 test
           - precision-matrix  # 16 tests (matrix combos)
           - full              #  1 test  (all 9 benchmarks)
           - output            #  3 tests (compact, compact+verbose, JSON)

@@ -3317,3 +3317,60 @@ class TestCsvOutputRoundTrip:
         assert r.serial == "S1"
         assert r.power_avg_w == 300.0
         assert r.temp_max_c == 70.0
+
+
+# ======================================================================
+# Melt (TIM settling) results
+# ======================================================================
+class TestMeltResults:
+    """A benchmark named "Melt" is just another (benchmark, dtype) group."""
+
+    def _melt_result(self):
+        return hr.GPUResult(
+            hostname="node0", gpu=0, gpu_model="GH200", serial="SN0",
+            benchmark="Melt", dtype="float32", iterations=33612,
+            runtime_s=4704.0, min_val=23900.0, mean_val=48000.0,
+            max_val=54120.0, unit="GFLOP/s", power_avg_w=600.0, temp_max_c=80.0,
+        )
+
+    def test_bench_key_and_label(self):
+        r = self._melt_result()
+        assert hr.bench_key(r) == ("Melt", "float32")
+        assert hr.bench_label(r) == "Melt (float32)"
+        assert hr.bench_label_from_key(hr.bench_key(r)) == "Melt (float32)"
+
+    def test_melt_groups_separately_from_gemm(self):
+        results = _make_results(n_nodes=1, n_gpus=2) + [self._melt_result()]
+        stats = hr.compute_benchmark_stats(results)
+        assert ("Melt", "float32") in stats
+        assert stats[("Melt", "float32")].unit == "GFLOP/s"
+        assert len(stats[("Batched GEMM", "float32")].gpu_means) == 2
+
+    def test_json_melt_bench_with_extra_fields_loads(self, tmp_path):
+        data = {
+            "metadata": {"hostname": "testhost"},
+            "gpus": [{
+                "gpu_index": 0, "model": "GH200", "serial": "SN0",
+                "benchmarks": [{
+                    "name": "Melt", "min": 23900, "mean": 48000, "max": 54120,
+                    "unit": "GFLOP/s", "iterations": 3, "runtime_s": 4704.0,
+                    "params": {"dtype": "float32"}, "telemetry": {},
+                    "settled": True, "settle_s": 4704.0, "cycles": 3,
+                    "reload_path": "h2d_pinned",
+                    "iteration_telemetry": [
+                        {"iteration": 0, "performance": 23900, "thermal_throttled": True,
+                         "power_min_W": 400.0, "power_max_W": 650.0,
+                         "telemetry": {"hw_slowdown": 1, "power_W": 650.0}},
+                        {"iteration": 1, "performance": 48000, "thermal_throttled": False,
+                         "power_min_W": 410.0, "power_max_W": 655.0,
+                         "telemetry": {"hw_slowdown": 0, "power_W": 655.0}},
+                    ]
+                }]
+            }]
+        }
+        p = tmp_path / "melt.json"
+        p.write_text(json.dumps(data))
+        results = hr.load_json(p)
+        assert len(results) == 1
+        assert results[0].benchmark == "Melt"
+        assert results[0].throttle_samples == 1

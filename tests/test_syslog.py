@@ -674,3 +674,47 @@ class TestSyslogDmesgValidation:
         assert args.syslog_dmesg is True
         assert args.syslog is False
         # The actual error call is in main(), tested via the flag states
+
+
+# ──────────────────────────────────────────────────────────────
+# 10. Melt (TIM settling) rows: settled / settle_s and PASS/FAIL
+# ──────────────────────────────────────────────────────────────
+class TestBuildSyslogRowMelt:
+    """Melt rows report settled state; status follows settled, not throttled."""
+
+    tel_data = {"hostname": "node01", "model": "GH200", "serial": "ABC"}
+
+    def _melt_perf(self, settled, settle_s):
+        return {
+            "name": "Melt", "unit": "GFLOP/s",
+            "min": 23900.0, "mean": 48000.0, "max": 54120.0,
+            "iterations": 33612, "runtime_s": settle_s or 5400.0,
+            "params": {"dtype": "float32"}, "telemetry": {},
+            "throttled": True,  # expected during melt
+            "settled": settled, "settle_s": settle_s,
+        }
+
+    def test_settled_melt_row(self, th):
+        row = th._build_syslog_row(self._melt_perf(True, 4704.0), self.tel_data, 0)
+        assert row["status"] == "PASS"
+        assert row["settled"] == "true"
+        assert row["settle_s"] == "4704.0"
+
+    def test_unsettled_melt_row_is_fail(self, th):
+        row = th._build_syslog_row(self._melt_perf(False, None), self.tel_data, 0)
+        assert row["status"] == "FAIL"
+        assert row["settled"] == "false"
+        assert "settle_s" not in row
+
+    def test_unsettled_melt_gets_err_priority(self, th):
+        reporter = object.__new__(th.SyslogReporter)
+        reporter._syslog = syslog
+        reporter.temp_warn, reporter.temp_critical, reporter.efficiency_warn = 90.0, 95.0, 70.0
+        row = th._build_syslog_row(self._melt_perf(False, None), self.tel_data, 0)
+        assert reporter._priority(row) == syslog.LOG_ERR
+
+    def test_non_melt_row_has_no_settled_fields(self, th):
+        perf = {"name": "Batched GEMM", "min": 1.0, "mean": 2.0, "max": 3.0, "unit": "GFLOP/s"}
+        row = th._build_syslog_row(perf, self.tel_data, 0)
+        assert "settled" not in row and "settle_s" not in row
+        assert row["status"] == "PASS"

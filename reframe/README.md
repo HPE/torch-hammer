@@ -179,7 +179,7 @@ Ensure modules are available and correctly named in your `settings.py`.
 
 `ci_functional_checks.py` is a separate, exhaustive check file designed for
 CI pipelines.  It covers **every benchmark × precision × parameter
-combination** (92 tests total) using deliberately tiny tensor sizes so the
+combination** (93 tests total) using deliberately tiny tensor sizes so the
 full suite finishes in minutes.
 
 Every check in both suites (`ci_functional_checks.py` and
@@ -191,11 +191,11 @@ remain acceptable where a benchmark cannot run a dtype on a backend (Atomic,
 Sparse, Schrödinger, FFT); a traceback never is.  The GitHub Actions workflow
 passes `--nocolor` so the ReFrame logs stay greppable.
 
-### Test Breakdown (92 tests)
+### Test Breakdown (93 tests)
 
 | Check class | Parameters | Count |
 |-------------|-----------|-------|
-| **Individual benchmark × precision** | | **67** |
+| **Individual benchmark × precision** | | **68** |
 | `CI_GEMM` | 6 precisions | 6 |
 | `CI_GEMM_TF32` | TF32 mode | 1 |
 | `CI_Conv` | 6 precisions | 6 |
@@ -206,6 +206,7 @@ passes `--nocolor` so the ReFrame logs stay greppable.
 | `CI_Schrodinger` | 6 precisions × 2 potentials | 12 |
 | `CI_Atomic` | 4 real precisions | 4 |
 | `CI_Sparse` | 2 supported precisions (float32, float64) | 2 |
+| `CI_Melt` | `--melt` with 2×64³ matrices and a 5 s duration; exercises the pinned host-to-device reload | 1 |
 | **Precision matrix (all benchmarks together)** | | **16** |
 | `CI_PrecisionMatrixStandard` | 7 benchmarks × 6 precisions | 6 |
 | `CI_PrecisionMatrixAll` | 9 benchmarks × 4 real precisions | 4 |
@@ -221,12 +222,12 @@ passes `--nocolor` so the ReFrame logs stay greppable.
 | `CI_ConfigYAML` | `--config` | 1 |
 | `CI_StressTest` | `--stress-test` | 1 |
 | `CI_Shuffle` | `--shuffle` | 1 |
-| **Total** | | **92** |
+| **Total** | | **93** |
 
 ### Running locally
 
 ```bash
-# All 92 CI checks
+# All 93 CI checks
 reframe -C reframe/settings.py -c reframe/ci_functional_checks.py -r -t ci
 
 # Only GEMM precision tests
@@ -249,12 +250,12 @@ Two workflows cover the full test pyramid:
 | Workflow | File | Runner | What it tests |
 |----------|------|--------|---------------|
 | **Functional Tests** | `.github/workflows/gpu-functional.yml` | `ubuntu-latest` (no GPU) | pytest suite (~287 tests) — parsing, smoke, compact, syslog, telemetry, utilities |
-| **GPU Functional Tests (ReFrame)** | `.github/workflows/gpu-reframe.yml` | `[self-hosted, gpu]` | ReFrame CI suite (92 tests) — every benchmark × precision on real GPU hardware |
+| **GPU Functional Tests (ReFrame)** | `.github/workflows/gpu-reframe.yml` | `[self-hosted, gpu]` | ReFrame CI suite (93 tests) — every benchmark × precision on real GPU hardware |
 
 The ReFrame workflow uses a matrix strategy with one leg per tag:
 
 ```
-gemm | conv | fft | einsum | memory | heat | schrodinger | atomic | sparse | precision-matrix | full | output | control
+gemm | conv | fft | einsum | memory | heat | schrodinger | atomic | sparse | melt | precision-matrix | full | output | control
 ```
 
 To enable the ReFrame workflow, register a self-hosted runner with labels
