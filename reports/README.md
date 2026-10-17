@@ -62,13 +62,16 @@ One row per (GPU, benchmark). Columns: `test,dtype,gpu,serial,performance,unit,.
 ### JSON (`--json-output`)
 
 Full torch-hammer JSON export with `metadata`, `runtime_args`, and `gpus[]`.
-Per-iteration telemetry data is extracted when present.
+Per-iteration telemetry data is extracted when present. In per-iteration
+records a telemetry field that is absent, blank or `N/A` is kept as
+`null` (a gap), while a measured `0` stays `0` -- the two are never conflated.
 
 ### Verbose log-dir files
 
 Per-GPU timestamp-prefixed CSV files produced by `--log-dir --verbose`.
 Auto-detected when a directory contains `.csv` or `.log` files with the
-verbose column layout.
+verbose column layout. Missing telemetry columns follow the same
+`null`-for-missing rule as JSON.
 
 ### Shell dump
 
@@ -107,8 +110,8 @@ Use `--shell-output` to force this mode, or let auto-detection handle it.
 ### CLI Summary (stderr)
 
 - **Fleet overview**: nodes, GPUs, GPU model, benchmark count
-- **Per-benchmark table**: fleet mean, CV%, avg power, max temp, throttle flag ("Thrt" column)
-- **Per-node health**: GPU count, test count, avg power, max temp, status (PASS/WARN/THRT)
+- **Per-benchmark table**: fleet mean, CV%, mean power, max temp, throttle flag ("Thrt" column)
+- **Per-node health**: GPU count, test count, mean power, max temp, status (PASS/WARN/THRT)
 - **Outlier list** with deviation % from fleet mean, direction (below/above fleet)
 - **Thermal throttling section**: lists affected GPUs when throttling is detected
 - **Location cluster summary**: groups outliers by location when `--node-map` is provided
@@ -156,12 +159,18 @@ offline.
   for >50 nodes (fleet mean bin highlighted)
 - **Dot plot mode** (`--dot-plot`): sigma-band colored dot plots with KDE density
   curve and rug plot, as an alternative to histograms
-- **Multi-metric panels**: performance, power (W), temperature (°C), SM utilization (%),
-  memory BW utilization (%), GPU clock (MHz)
+- **Multi-metric panels**, each titled "Fleet distribution of GPU mean/max &lt;metric&gt;":
+  performance, power (W), temperature (°C, per-GPU max), SM utilization (%),
+  memory BW utilization (%), GPU clock (MHz). The performance chart is
+  full-width (960-unit viewBox); the diagnostic panels are compact small
+  multiples (360-unit viewBox, three per row) with fewer ticks, no legend and
+  no per-point labels, so their text renders at the same size as the main
+  chart instead of shrinking with the grid cell
 - **Chart zoom button** for closer inspection
 - **Sortable tables**: click any column header to sort ascending/descending
   (via `data-sort` attributes)
-- **"vs fleet" column**: signed % deviation from fleet mean per node
+- **"node mean" and "vs fleet" columns**: per-node mean of GPU means, and its
+  signed % deviation from the fleet mean
 - **Truncated tables** for large fleets: bottom 5, outliers, top 5 with section labels
   and "Show all rows" toggle
 - **Percentile stats** (p5, median, p95) for large fleets
@@ -185,7 +194,8 @@ self-contained HTML file. Falls back to static SVG if Plotly is not installed.
 
 **Fleet Map**: Topology-aware grid layout. Auto-detects Cray EX xname format
 (`xNNNNcCsCbB`) and groups by cabinet with chassis/slot/board positioning.
-Falls back to performance-sorted grid. Supports `--node-map` location grouping.
+Falls back to a flat grid in ascending node mean. Supports `--node-map`
+location grouping.
 
 **Fleet Distribution**: Histogram with per-GPU rug plot, sigma-band coloring
 (1/2/3 sigma), fleet mean and sigma lines, stats legend with kurtosis.
@@ -193,16 +203,20 @@ Falls back to performance-sorted grid. Supports `--node-map` location grouping.
 **Power vs Performance**: Scatter plot with temperature color gradient.
 Outlier and throttled GPUs get distinct sizing. Power limit detection.
 
-**Node Variability**: Strip plot sorted by mean performance. Outlier and
-throttle color coding. Adaptive truncation for >60 nodes.
+**Node Variability**: Strip plot in ascending node mean, left to right, for
+every metric; colour carries good/bad (outlier and throttle coding). Adaptive
+truncation for >60 nodes keeps both ends plus abnormal nodes.
 
 **Iteration Trace**: p10--p90 envelope for large fleets, individual lines for
 outlier/throttled GPUs, rolling mean smoothing, adaptive downsampling.
 Per-iteration data from JSON or verbose logs.
 
 **Fleet Waterfall**: Heatmap with spectrum trace. Multiple sort modes
-(topology/performance/hostname), per-metric dropdown, node-level aggregation
-for >100 GPUs, SDR-style colorscale.
+(topology / by value ascending / hostname), per-metric dropdown, node-level
+aggregation for >100 GPUs, SDR-style colorscale. Utilization metrics use a
+fixed 0--100 colour domain; other metrics span the p2--p98 of the cells. A
+cell with no sample is a transparent gap with no hover; a measured `0` is
+coloured and hoverable like any other value.
 
 **Fleet Inventory**: Filterable, sortable table with show-all toggle and
 status icons.

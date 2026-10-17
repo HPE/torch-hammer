@@ -158,6 +158,41 @@ def _safe_int(val, default=0):
         return default
 
 
+def _opt_float(val):
+    # type: (object) -> Optional[float]
+    """Optional telemetry value: None when absent, blank, N/A or unparseable.
+
+    A measured 0 stays 0.0 -- zero is data, missing is null (T19).
+    """
+    if val is None:
+        return None
+    try:
+        v = float(val)
+    except (ValueError, TypeError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+_OPTIONAL_ITERATION_TELEMETRY = (
+    "power_W", "temp_gpu_C", "sm_util", "mem_bw_util", "gpu_clock",
+)
+
+
+def _optional_iteration_telemetry(source):
+    # type: (Dict[str, object]) -> Dict[str, Optional[float]]
+    """Per-iteration telemetry columns that a collector may not provide."""
+    return {k: _opt_float(source.get(k)) for k in _OPTIONAL_ITERATION_TELEMETRY}
+
+
+def _safe_json(obj):
+    # type: (object) -> str
+    """json.dumps with `</` escaped so the text can sit inside <script>.
+
+    None serialises as `null`, which the JS reads as a gap (T19).
+    """
+    return json.dumps(obj).replace("</", "<\\/")
+
+
 def _parse_compact_row(row):
     # type: (Dict[str, str]) -> Optional[GPUResult]
     """Parse one row from --compact CSV output."""
@@ -319,16 +354,13 @@ def load_json(path):
                 iter_records = []
                 for entry in iter_tel:
                     tel = entry.get("telemetry", {})
-                    iter_records.append({
+                    record = {
                         "iteration": entry.get("iteration", 0),
                         "performance": _safe_float(entry.get("performance", 0)),
-                        "power_W": _safe_float(tel.get("power_W", 0)),
-                        "temp_gpu_C": _safe_float(tel.get("temp_gpu_C", 0)),
-                        "sm_util": _safe_float(tel.get("sm_util", 0)),
-                        "mem_bw_util": _safe_float(tel.get("mem_bw_util", 0)),
-                        "gpu_clock": _safe_float(tel.get("gpu_clock", 0)),
-                        "throttled": _safe_int(tel.get("throttled", 0)),
-                    })
+                    }
+                    record.update(_optional_iteration_telemetry(tel))
+                    record["throttled"] = _safe_int(tel.get("throttled", 0))
+                    iter_records.append(record)
                 _iteration_data[iter_key] = iter_records
 
     return results
@@ -541,16 +573,13 @@ def load_verbose_log(path):
         iter_records = []
         for i, r in enumerate(rows):
             mn = r.get("_metric_name", "gflops")
-            iter_records.append({
+            record = {
                 "iteration": i,
                 "performance": _safe_float(r.get(mn, "0")),
-                "power_W": _safe_float(r.get("power_W", "0")),
-                "temp_gpu_C": _safe_float(r.get("temp_gpu_C", "0")),
-                "sm_util": _safe_float(r.get("sm_util", "0")),
-                "mem_bw_util": _safe_float(r.get("mem_bw_util", "0")),
-                "gpu_clock": _safe_float(r.get("gpu_clock", "0")),
-                "throttled": _safe_int(r.get("throttled", "0")),
-            })
+            }
+            record.update(_optional_iteration_telemetry(r))
+            record["throttled"] = _safe_int(r.get("throttled", "0"))
+            iter_records.append(record)
         if iter_records:
             _iteration_data[iter_key] = iter_records
 
@@ -894,10 +923,10 @@ def print_summary(results, bench_stats, outliers, threshold,
         has_loc = bool(node_map)
         if has_loc:
             hdr2 = "{:<20} {:<16} {:>5} {:>6} {:>10} {:>9} {:>8}".format(
-                "Node", "Location", "GPUs", "Tests", "Avg Power", "Max Temp", "Status")
+                "Node", "Location", "GPUs", "Tests", "Mean Power", "Max Temp", "Status")
         else:
             hdr2 = "{:<20} {:>5} {:>6} {:>10} {:>9} {:>8}".format(
-                "Node", "GPUs", "Tests", "Avg Power", "Max Temp", "Status")
+                "Node", "GPUs", "Tests", "Mean Power", "Max Temp", "Status")
         print(hdr2, file=out)
         print("-" * len(hdr2), file=out)
 
@@ -1294,11 +1323,72 @@ def _nice_ticks(lo, hi, n=5):
 
 _SVG_W = 960
 _SVG_H = 320
-_SVG_H_SM = 260  # shorter, for secondary charts
+# T24: small multiples get their own viewBox. The three-up .chart-row cell is
+# ~350 px wide on a 1200 px page, so a 360-unit box renders ~1 unit per px
+# and 11-unit text stays at the T23 legibility floor (a 960-unit box scaled
+# into the same cell renders 11-unit text at ~4 px).
+_SVG_W_SM = 360
+_SVG_H_SM = 220  # h ~ 0.62 w
+_SVG_H_STRIP = 260  # shorter full-width strip used by _svg_single_bar
 _ML = 72   # margin left
 _MR = 24   # margin right
 _MT = 24   # margin top
 _MB = 60   # margin bottom
+# T25: what a compact chart may carry
+_COMPACT_MAX_X_LABELS = 8
+_COMPACT_Y_TICKS = 4
+_COMPACT_NOTE_FONT = 11  # threshold / mean annotations; 10 in full charts
+
+
+@dataclass
+class _ChartGeometry:
+    """ViewBox and margins for one SVG chart.
+
+    ``compact`` charts (T24/T25) shrink margins with the box so the plot area
+    keeps ~80% of the width, and drop legends and per-point labels.
+    """
+    w: int
+    h: int
+    ml: int
+    mr: int
+    mt: int
+    mb: int
+    compact: bool = False
+
+    @property
+    def plot_w(self):
+        # type: () -> int
+        return self.w - self.ml - self.mr
+
+    @property
+    def plot_h(self):
+        # type: () -> int
+        return self.h - self.mt - self.mb
+
+    @property
+    def note_font(self):
+        # type: () -> int
+        return _COMPACT_NOTE_FONT if self.compact else 10
+
+    @property
+    def y_title_x(self):
+        # type: () -> int
+        """Centre x of the rotated y-axis title, clear of the tick labels."""
+        return 10 if self.compact else 16
+
+
+def _chart_geometry(compact=False, h=_SVG_H):
+    # type: (bool, int) -> _ChartGeometry
+    if compact:
+        return _ChartGeometry(w=_SVG_W_SM, h=_SVG_H_SM, ml=52, mr=10, mt=18, mb=36,
+                              compact=True)
+    return _ChartGeometry(w=_SVG_W, h=h, ml=_ML, mr=_MR, mt=_MT, mb=_MB)
+
+
+def _label_step(n_items, max_labels):
+    # type: (int, int) -> int
+    """Every k-th item gets a label so that at most ``max_labels`` are drawn."""
+    return max(1, -(-n_items // max_labels))
 
 
 def _svg_open(w, h):
@@ -1310,36 +1400,38 @@ def _svg_open(w, h):
     ).format(w=w, h=h)
 
 
-def _svg_bar_chart(nodes, gpu_indices, by_node, unit, y_min, y_max, fleet_mean=None):
-    # type: (list, list, dict, str, float, float, ...) -> str
+def _svg_bar_chart(nodes, gpu_indices, by_node, unit, y_min, y_max, fleet_mean=None,
+                   compact=False):
+    # type: (list, list, dict, str, float, float, ..., bool) -> str
     """Grouped bar chart as inline SVG for <=50 nodes."""
-    w, h = _SVG_W, _SVG_H
-    plot_w = w - _ML - _MR
-    plot_h = h - _MT - _MB
+    g = _chart_geometry(compact)
+    w, h = g.w, g.h
+    ml, mr, mt, mb = g.ml, g.mr, g.mt, g.mb
+    plot_w, plot_h = g.plot_w, g.plot_h
 
     parts = [_svg_open(w, h)]
 
     # Y-axis ticks + gridlines
-    ticks = _nice_ticks(y_min, y_max)
+    ticks = _nice_ticks(y_min, y_max, _COMPACT_Y_TICKS if compact else 5)
     for tv in ticks:
         if y_max > y_min:
-            yp = _MT + plot_h - (tv - y_min) / (y_max - y_min) * plot_h
+            yp = mt + plot_h - (tv - y_min) / (y_max - y_min) * plot_h
         else:
-            yp = _MT + plot_h / 2
+            yp = mt + plot_h / 2
         parts.append(
             '<line x1="{ml}" y1="{y}" x2="{xr}" y2="{y}" '
             'stroke="rgba(128,128,128,0.12)" stroke-dasharray="2,4"/>'.format(
-                ml=_ML, xr=w - _MR, y=round(yp, 1)))
+                ml=ml, xr=w - mr, y=round(yp, 1)))
         parts.append(
             '<text x="{x}" y="{y}" text-anchor="end" '
             'font-size="12" fill="var(--muted,#6b6b65)">{lbl}</text>'.format(
-                x=_ML - 6, y=round(yp + 3, 1), lbl=_esc(_fmt_tick(tv))))
+                x=ml - 6, y=round(yp + 3, 1), lbl=_esc(_fmt_tick(tv))))
 
     # Y-axis title
     parts.append(
-        '<text x="16" y="{cy}" text-anchor="middle" font-size="13" '
-        'fill="var(--muted,#6b6b65)" transform="rotate(-90,16,{cy})">{u}</text>'.format(
-            cy=round(_MT + plot_h / 2), u=_esc(unit)))
+        '<text x="{tx}" y="{cy}" text-anchor="middle" font-size="13" '
+        'fill="var(--muted,#6b6b65)" transform="rotate(-90,{tx},{cy})">{u}</text>'.format(
+            tx=g.y_title_x, cy=round(mt + plot_h / 2), u=_esc(unit)))
 
     # Bars
     n_nodes = len(nodes)
@@ -1353,7 +1445,7 @@ def _svg_bar_chart(nodes, gpu_indices, by_node, unit, y_min, y_max, fleet_mean=N
     gap = bar_w * 0.25
 
     for ni, node in enumerate(nodes):
-        gx = _ML + ni * group_w
+        gx = ml + ni * group_w
         for gi, gpu_idx in enumerate(gpu_indices):
             gpu_row = next((r for r in by_node[node] if r.gpu == gpu_idx), None)
             if not gpu_row:
@@ -1363,7 +1455,7 @@ def _svg_bar_chart(nodes, gpu_indices, by_node, unit, y_min, y_max, fleet_mean=N
                 continue
             bar_h = (val - y_min) / (y_max - y_min) * plot_h
             bx = gx + gi * bar_w + gap
-            by = _MT + plot_h - bar_h
+            by = mt + plot_h - bar_h
             color = OKABE_ITO[gi % len(OKABE_ITO)]
             parts.append(
                 '<rect x="{x}" y="{y}" width="{bw}" height="{bh}" '
@@ -1377,57 +1469,67 @@ def _svg_bar_chart(nodes, gpu_indices, by_node, unit, y_min, y_max, fleet_mean=N
 
     # Fleet mean reference line
     if fleet_mean is not None and y_max > y_min and y_min <= fleet_mean <= y_max:
-        my = _MT + plot_h - (fleet_mean - y_min) / (y_max - y_min) * plot_h
+        my = mt + plot_h - (fleet_mean - y_min) / (y_max - y_min) * plot_h
         parts.append(
             '<line x1="{ml}" y1="{y}" x2="{xr}" y2="{y}" '
             'stroke="var(--danger,#f09595)" stroke-width="1.5" '
             'stroke-dasharray="6,4" opacity="0.8"/>'.format(
-                ml=_ML, xr=w - _MR, y=round(my, 1)))
+                ml=ml, xr=w - mr, y=round(my, 1)))
         parts.append(
             '<text x="{x}" y="{y}" text-anchor="end" '
             'font-size="11" fill="var(--danger,#f09595)" opacity="0.8">'
             'fleet mean</text>'.format(
-                x=w - _MR, y=round(my - 4, 1)))
+                x=w - mr, y=round(my - 4, 1)))
 
-    # X-axis labels
+    # X-axis labels (T25: a compact chart labels at most every k-th node)
     rotate = n_nodes > 10
+    step = _label_step(n_nodes, _COMPACT_MAX_X_LABELS) if compact else 1
     for ni, node in enumerate(nodes):
-        cx = _ML + ni * group_w + group_w / 2
+        if ni % step:
+            continue
+        cx = ml + ni * group_w + group_w / 2
         if rotate:
             parts.append(
                 '<text x="{x}" y="{y}" text-anchor="end" font-size="11" '
                 'fill="var(--muted,#6b6b65)" '
                 'transform="rotate(-45,{x},{y})">{n}</text>'.format(
-                    x=round(cx, 1), y=h - _MB + 14, n=_esc(node)))
+                    x=round(cx, 1), y=h - mb + 14, n=_esc(node)))
         else:
             parts.append(
                 '<text x="{x}" y="{y}" text-anchor="middle" font-size="12" '
                 'fill="var(--muted,#6b6b65)">{n}</text>'.format(
-                    x=round(cx, 1), y=h - _MB + 16, n=_esc(node)))
+                    x=round(cx, 1), y=h - mb + 16, n=_esc(node)))
 
-    # Legend (top-right)
-    for gi, gpu_idx in enumerate(gpu_indices):
-        lx = w - _MR - (n_gpus - gi) * 80
-        ly = _MT + 4
-        color = OKABE_ITO[gi % len(OKABE_ITO)]
-        parts.append(
-            '<rect x="{x}" y="{y}" width="12" height="12" fill="{c}" rx="2"/>'.format(
-                x=lx, y=ly, c=color))
-        parts.append(
-            '<text x="{x}" y="{y}" font-size="12" '
-            'fill="var(--muted,#6b6b65)">GPU {gpu}</text>'.format(
-                x=lx + 16, y=ly + 10, gpu=gpu_idx))
+    if not compact:  # T25: a compact chart has no legend
+        _svg_gpu_legend(parts, gpu_indices, w - mr, mt + 4)
 
     parts.append('</svg>')
     return "\n".join(parts)
 
 
-def _svg_histogram(vals, unit, mean_val, n_bins=40, threshold_pct=None):
-    # type: (list, str, float, int, ...) -> str
+def _svg_gpu_legend(parts, gpu_indices, right_x, top_y):
+    # type: (list, list, int, int) -> None
+    """Append the per-GPU colour legend, right-aligned at ``right_x``."""
+    n_gpus = len(gpu_indices)
+    for gi, gpu_idx in enumerate(gpu_indices):
+        lx = right_x - (n_gpus - gi) * 80
+        color = OKABE_ITO[gi % len(OKABE_ITO)]
+        parts.append(
+            '<rect x="{x}" y="{y}" width="12" height="12" fill="{c}" rx="2"/>'.format(
+                x=lx, y=top_y, c=color))
+        parts.append(
+            '<text x="{x}" y="{y}" font-size="12" '
+            'fill="var(--muted,#6b6b65)">GPU {gpu}</text>'.format(
+                x=lx + 16, y=top_y + 10, gpu=gpu_idx))
+
+
+def _svg_histogram(vals, unit, mean_val, n_bins=40, threshold_pct=None, compact=False):
+    # type: (list, str, float, int, ..., bool) -> str
     """Histogram distribution as inline SVG."""
-    w, h = _SVG_W, _SVG_H
-    plot_w = w - _ML - _MR
-    plot_h = h - _MT - _MB
+    g = _chart_geometry(compact)
+    w, h = g.w, g.h
+    ml, mr, mt, mb = g.ml, g.mr, g.mt, g.mb
+    plot_w, plot_h = g.plot_w, g.plot_h
 
     if not vals:
         return ""
@@ -1465,33 +1567,33 @@ def _svg_histogram(vals, unit, mean_val, n_bins=40, threshold_pct=None):
 
     bar_w = plot_w / n_bins
 
-    # Y-axis ticks
-    y_ticks = _nice_ticks(0, max_count, 5)
+    # Y-axis ticks (T25: fewer in a compact chart)
+    y_ticks = _nice_ticks(0, max_count, _COMPACT_Y_TICKS if compact else 5)
     for tv in y_ticks:
-        yp = _MT + plot_h - tv / max_count * plot_h
+        yp = mt + plot_h - tv / max_count * plot_h
         parts.append(
             '<line x1="{ml}" y1="{y}" x2="{xr}" y2="{y}" '
             'stroke="rgba(128,128,128,0.12)" stroke-dasharray="2,4"/>'.format(
-                ml=_ML, xr=w - _MR, y=round(yp, 1)))
+                ml=ml, xr=w - mr, y=round(yp, 1)))
         parts.append(
             '<text x="{x}" y="{y}" text-anchor="end" '
             'font-size="12" fill="var(--muted,#6b6b65)">{lbl}</text>'.format(
-                x=_ML - 6, y=round(yp + 3, 1), lbl=int(tv)))
+                x=ml - 6, y=round(yp + 3, 1), lbl=int(tv)))
 
     # Y-axis title
     parts.append(
-        '<text x="16" y="{cy}" text-anchor="middle" font-size="13" '
-        'fill="var(--muted,#6b6b65)" transform="rotate(-90,16,{cy})">GPU count</text>'.format(
-            cy=round(_MT + plot_h / 2)))
+        '<text x="{tx}" y="{cy}" text-anchor="middle" font-size="13" '
+        'fill="var(--muted,#6b6b65)" transform="rotate(-90,{tx},{cy})">GPU count</text>'.format(
+            tx=g.y_title_x, cy=round(mt + plot_h / 2)))
 
     # Bars
     for i in range(n_bins):
         count = bins[i]
         if count == 0:
             continue
-        bx = _ML + i * bar_w
+        bx = ml + i * bar_w
         bar_h = count / max_count * plot_h
-        by = _MT + plot_h - bar_h
+        by = mt + plot_h - bar_h
         bin_lo = lo + i * bin_width
         bin_hi = bin_lo + bin_width
         bin_center = bin_lo + bin_width / 2
@@ -1511,63 +1613,65 @@ def _svg_histogram(vals, unit, mean_val, n_bins=40, threshold_pct=None):
                 blo=_esc(_fmt_tick(bin_lo)), bhi=_esc(_fmt_tick(bin_hi)),
                 unit=_esc(unit), cnt=count))
 
-    # X-axis labels (spread across range)
-    n_labels = min(10, n_bins)
-    step = max(1, n_bins // n_labels)
+    # X-axis labels (spread across range; T25 caps a compact chart at 8)
+    if compact:
+        step = _label_step(n_bins, _COMPACT_MAX_X_LABELS)
+    else:
+        step = max(1, n_bins // min(10, n_bins))
     for i in range(0, n_bins, step):
-        cx = _ML + i * bar_w + bar_w / 2
+        cx = ml + i * bar_w + bar_w / 2
         val = lo + i * bin_width + bin_width / 2
         parts.append(
             '<text x="{x}" y="{y}" text-anchor="middle" font-size="11" '
             'fill="var(--muted,#6b6b65)">{lbl}</text>'.format(
-                x=round(cx, 1), y=h - _MB + 16, lbl=_esc(_fmt_tick(val))))
+                x=round(cx, 1), y=h - mb + 16, lbl=_esc(_fmt_tick(val))))
 
     # X-axis title
     parts.append(
         '<text x="{cx}" y="{y}" text-anchor="middle" font-size="13" '
         'fill="var(--muted,#6b6b65)">{u}</text>'.format(
-            cx=round(_ML + plot_w / 2), y=h - 4, u=_esc(unit)))
+            cx=round(ml + plot_w / 2), y=h - 4, u=_esc(unit)))
 
     # Threshold lines (drawn on top of bars)
     if threshold_pct is not None:
         if lo < lo_bound < hi:
-            lx = _ML + (lo_bound - lo) / (hi - lo) * plot_w
+            lx = ml + (lo_bound - lo) / (hi - lo) * plot_w
             parts.append(
                 '<line x1="{x}" y1="{mt}" x2="{x}" y2="{mb}" '
                 'stroke="var(--danger,#f09595)" stroke-width="1" '
                 'stroke-dasharray="4,3" opacity="0.7"/>'.format(
-                    x=round(lx, 1), mt=_MT, mb=_MT + plot_h))
+                    x=round(lx, 1), mt=mt, mb=mt + plot_h))
             parts.append(
                 '<text x="{x}" y="{y}" text-anchor="middle" '
-                'font-size="10" fill="var(--danger,#f09595)" opacity="0.7">'
+                'font-size="{fs}" fill="var(--danger,#f09595)" opacity="0.7">'
                 '-{t}%</text>'.format(
-                    x=round(lx, 1), y=_MT - 4, t=int(threshold_pct)))
+                    x=round(lx, 1), y=mt - 4, fs=g.note_font, t=int(threshold_pct)))
         if lo < hi_bound < hi:
-            hx = _ML + (hi_bound - lo) / (hi - lo) * plot_w
+            hx = ml + (hi_bound - lo) / (hi - lo) * plot_w
             parts.append(
                 '<line x1="{x}" y1="{mt}" x2="{x}" y2="{mb}" '
                 'stroke="var(--danger,#f09595)" stroke-width="1" '
                 'stroke-dasharray="4,3" opacity="0.7"/>'.format(
-                    x=round(hx, 1), mt=_MT, mb=_MT + plot_h))
+                    x=round(hx, 1), mt=mt, mb=mt + plot_h))
             parts.append(
                 '<text x="{x}" y="{y}" text-anchor="middle" '
-                'font-size="10" fill="var(--danger,#f09595)" opacity="0.7">'
+                'font-size="{fs}" fill="var(--danger,#f09595)" opacity="0.7">'
                 '+{t}%</text>'.format(
-                    x=round(hx, 1), y=_MT - 4, t=int(threshold_pct)))
+                    x=round(hx, 1), y=mt - 4, fs=g.note_font, t=int(threshold_pct)))
 
     # Fleet mean vertical line
     if lo <= mean_val <= hi:
-        mx = _ML + (mean_val - lo) / (hi - lo) * plot_w
+        mx = ml + (mean_val - lo) / (hi - lo) * plot_w
         parts.append(
             '<line x1="{x}" y1="{mt}" x2="{x}" y2="{mb}" '
             'stroke="var(--muted,#9a9a92)" stroke-width="1.5" '
             'opacity="0.8"/>'.format(
-                x=round(mx, 1), mt=_MT, mb=_MT + plot_h))
+                x=round(mx, 1), mt=mt, mb=mt + plot_h))
         parts.append(
             '<text x="{x}" y="{y}" text-anchor="middle" '
-            'font-size="10" fill="var(--muted,#9a9a92)" opacity="0.8">'
-            '\u00f8</text>'.format(
-                x=round(mx, 1), y=_MT - 4))
+            'font-size="{fs}" fill="var(--muted,#9a9a92)" opacity="0.8">'
+            'mean</text>'.format(
+                x=round(mx, 1), y=mt - 4, fs=g.note_font))
 
     parts.append('</svg>')
     return "\n".join(parts)
@@ -1602,18 +1706,19 @@ def _sigma_band(val, mean, stdev):
 
 
 def _svg_dot_plot(vals, unit, mean_val, n_bins=40, threshold_pct=None,
-                  results=None):
-    # type: (list, str, float, int, ..., ...) -> str
+                  results=None, compact=False):
+    # type: (list, str, float, int, ..., ..., bool) -> str
     """Rug-density plot: KDE density curve above, sigma-colored rug ticks below.
 
     Top zone (~70% of plot height): filled density curve showing fleet
     distribution shape.  Bottom zone (~30%): rug plot where every GPU is a
     vertical tick mark colored by sigma band.  Outliers beyond 2 sigma get
-    taller ticks; beyond 3 sigma get text labels.
+    taller ticks; beyond 3 sigma get text labels (full size only, T25).
     """
-    w, h = _SVG_W, _SVG_H
-    plot_w = w - _ML - _MR
-    plot_h = h - _MT - _MB
+    g = _chart_geometry(compact)
+    w, h = g.w, g.h
+    ml, mr, mt, mb = g.ml, g.mr, g.mt, g.mb
+    plot_w, plot_h = g.plot_w, g.plot_h
 
     if not vals:
         return ""
@@ -1631,12 +1736,12 @@ def _svg_dot_plot(vals, unit, mean_val, n_bins=40, threshold_pct=None,
     rug_frac = 0.28
     density_h = plot_h * (1 - rug_frac)      # top zone for density
     rug_h = plot_h * rug_frac                 # bottom zone for rug
-    rug_top = _MT + density_h                 # y where rug zone starts
-    rug_base = _MT + plot_h                   # bottom of rug zone (baseline)
+    rug_top = mt + density_h                 # y where rug zone starts
+    rug_base = mt + plot_h                   # bottom of rug zone (baseline)
 
     def x_pos(v):
         """Map a data value to pixel x-coordinate."""
-        return _ML + (v - lo) / (hi - lo) * plot_w
+        return ml + (v - lo) / (hi - lo) * plot_w
 
     # ----- KDE (Gaussian kernel density estimate) -----
     # Silverman bandwidth; evaluated over n_bins sample points for the curve.
@@ -1732,9 +1837,10 @@ def _svg_dot_plot(vals, unit, mean_val, n_bins=40, threshold_pct=None,
             outlier_labels.append((px, res.hostname, res.gpu, v))
 
     # ----- Outlier labels (>3 sigma, deduplicated by position) -----
-    # Limit labels to avoid clutter; pick the most extreme values
+    # Limit labels to avoid clutter; pick the most extreme values.
+    # T25: a compact chart carries no per-point labels at all.
     outlier_labels.sort(key=lambda t: abs(t[3] - mean), reverse=True)
-    max_labels = min(12, len(outlier_labels))
+    max_labels = 0 if compact else min(12, len(outlier_labels))
     placed_labels = []
     min_label_gap = 50  # minimum px between label anchors
     for px, hostname, gpu, v in outlier_labels[:max_labels]:
@@ -1755,31 +1861,31 @@ def _svg_dot_plot(vals, unit, mean_val, n_bins=40, threshold_pct=None,
     parts.append(
         '<line x1="{ml}" y1="{y}" x2="{xr}" y2="{y}" '
         'stroke="rgba(128,128,128,0.15)" stroke-width="0.5"/>'.format(
-            ml=_ML, xr=w - _MR, y=round(rug_top, 1)))
+            ml=ml, xr=w - mr, y=round(rug_top, 1)))
 
-    # ----- X-axis labels -----
-    x_ticks = _nice_ticks(lo, hi, 8)
+    # ----- X-axis labels (T25: fewer in a compact chart) -----
+    x_ticks = _nice_ticks(lo, hi, 5 if compact else 8)
     for tv in x_ticks:
         if lo <= tv <= hi:
             tx = x_pos(tv)
             parts.append(
                 '<text x="{x}" y="{y}" text-anchor="middle" font-size="11" '
                 'fill="var(--muted,#6b6b65)">{lbl}</text>'.format(
-                    x=round(tx, 1), y=h - _MB + 16,
+                    x=round(tx, 1), y=h - mb + 16,
                     lbl=_esc(_fmt_tick(tv))))
 
     # X-axis title
     parts.append(
         '<text x="{cx}" y="{y}" text-anchor="middle" font-size="13" '
         'fill="var(--muted,#6b6b65)">{u}</text>'.format(
-            cx=round(_ML + plot_w / 2), y=h - 4, u=_esc(unit)))
+            cx=round(ml + plot_w / 2), y=h - 4, u=_esc(unit)))
 
     # Y-axis label for density zone
     parts.append(
-        '<text x="16" y="{cy}" text-anchor="middle" font-size="13" '
+        '<text x="{tx}" y="{cy}" text-anchor="middle" font-size="13" '
         'fill="var(--muted,#6b6b65)" '
-        'transform="rotate(-90,16,{cy})">density</text>'.format(
-            cy=round(_MT + density_h / 2)))
+        'transform="rotate(-90,{tx},{cy})">density</text>'.format(
+            tx=g.y_title_x, cy=round(mt + density_h / 2)))
 
     # ----- Threshold lines (full height) -----
     if threshold_pct is not None:
@@ -1791,24 +1897,24 @@ def _svg_dot_plot(vals, unit, mean_val, n_bins=40, threshold_pct=None,
                 '<line x1="{x}" y1="{mt}" x2="{x}" y2="{mb}" '
                 'stroke="var(--danger,#f09595)" stroke-width="1" '
                 'stroke-dasharray="4,3" opacity="0.7"/>'.format(
-                    x=round(lx, 1), mt=_MT, mb=rug_base))
+                    x=round(lx, 1), mt=mt, mb=rug_base))
             parts.append(
                 '<text x="{x}" y="{y}" text-anchor="middle" '
-                'font-size="10" fill="var(--danger,#f09595)" opacity="0.7">'
+                'font-size="{fs}" fill="var(--danger,#f09595)" opacity="0.7">'
                 '-{t}%</text>'.format(
-                    x=round(lx, 1), y=_MT - 4, t=int(threshold_pct)))
+                    x=round(lx, 1), y=mt - 4, fs=g.note_font, t=int(threshold_pct)))
         if lo < hi_bound < hi:
             hx = x_pos(hi_bound)
             parts.append(
                 '<line x1="{x}" y1="{mt}" x2="{x}" y2="{mb}" '
                 'stroke="var(--danger,#f09595)" stroke-width="1" '
                 'stroke-dasharray="4,3" opacity="0.7"/>'.format(
-                    x=round(hx, 1), mt=_MT, mb=rug_base))
+                    x=round(hx, 1), mt=mt, mb=rug_base))
             parts.append(
                 '<text x="{x}" y="{y}" text-anchor="middle" '
-                'font-size="10" fill="var(--danger,#f09595)" opacity="0.7">'
+                'font-size="{fs}" fill="var(--danger,#f09595)" opacity="0.7">'
                 '+{t}%</text>'.format(
-                    x=round(hx, 1), y=_MT - 4, t=int(threshold_pct)))
+                    x=round(hx, 1), y=mt - 4, fs=g.note_font, t=int(threshold_pct)))
 
     # ----- Fleet mean vertical line -----
     if lo <= mean_val <= hi:
@@ -1817,16 +1923,16 @@ def _svg_dot_plot(vals, unit, mean_val, n_bins=40, threshold_pct=None,
             '<line x1="{x}" y1="{mt}" x2="{x}" y2="{mb}" '
             'stroke="var(--muted,#9a9a92)" stroke-width="1.5" '
             'opacity="0.8"/>'.format(
-                x=round(mx, 1), mt=_MT, mb=rug_base))
+                x=round(mx, 1), mt=mt, mb=rug_base))
         parts.append(
             '<text x="{x}" y="{y}" text-anchor="middle" '
-            'font-size="10" fill="var(--muted,#9a9a92)" opacity="0.8">'
-            '\u00f8</text>'.format(
-                x=round(mx, 1), y=_MT - 4))
+            'font-size="{fs}" fill="var(--muted,#9a9a92)" opacity="0.8">'
+            'mean</text>'.format(
+                x=round(mx, 1), y=mt - 4, fs=g.note_font))
 
-    # ----- Sigma band legend -----
-    if stdev > 0:
-        lx = w - _MR - 280
+    # ----- Sigma band legend (T25: none in a compact chart) -----
+    if stdev > 0 and not compact:
+        lx = w - mr - 280
         ly = h - 14
         for si, (sc, slbl) in enumerate(SIGMA_COLORS):
             sx = lx + si * 70
@@ -1843,12 +1949,13 @@ def _svg_dot_plot(vals, unit, mean_val, n_bins=40, threshold_pct=None,
     return "\n".join(parts)
 
 
-def _svg_single_bar(nodes, node_values, unit, color):
-    # type: (list, dict, str, str) -> str
+def _svg_single_bar(nodes, node_values, unit, color, compact=False):
+    # type: (list, dict, str, str, bool) -> str
     """Simple per-node bar chart as inline SVG for secondary metrics."""
-    w, h = _SVG_W, _SVG_H_SM
-    plot_w = w - _ML - _MR
-    plot_h = h - _MT - _MB
+    g = _chart_geometry(compact, h=_SVG_H_STRIP)
+    w, h = g.w, g.h
+    ml, mr, mt, mb = g.ml, g.mr, g.mt, g.mb
+    plot_w, plot_h = g.plot_w, g.plot_h
 
     data = [node_values.get(n, 0) for n in nodes]
     pos_vals = [v for v in data if v > 0]
@@ -1865,21 +1972,21 @@ def _svg_single_bar(nodes, node_values, unit, color):
     # Y-axis
     ticks = _nice_ticks(y_min, y_max, 4)
     for tv in ticks:
-        yp = _MT + plot_h - (tv - y_min) / (y_max - y_min) * plot_h
+        yp = mt + plot_h - (tv - y_min) / (y_max - y_min) * plot_h
         parts.append(
             '<line x1="{ml}" y1="{y}" x2="{xr}" y2="{y}" '
             'stroke="rgba(128,128,128,0.12)" stroke-dasharray="2,4"/>'.format(
-                ml=_ML, xr=w - _MR, y=round(yp, 1)))
+                ml=ml, xr=w - mr, y=round(yp, 1)))
         parts.append(
             '<text x="{x}" y="{y}" text-anchor="end" '
             'font-size="12" fill="var(--muted,#6b6b65)">{lbl}</text>'.format(
-                x=_ML - 6, y=round(yp + 3, 1), lbl=_esc(_fmt_tick(tv))))
+                x=ml - 6, y=round(yp + 3, 1), lbl=_esc(_fmt_tick(tv))))
 
     # Y-axis title
     parts.append(
-        '<text x="16" y="{cy}" text-anchor="middle" font-size="13" '
-        'fill="var(--muted,#6b6b65)" transform="rotate(-90,16,{cy})">{u}</text>'.format(
-            cy=round(_MT + plot_h / 2), u=_esc(unit)))
+        '<text x="{tx}" y="{cy}" text-anchor="middle" font-size="13" '
+        'fill="var(--muted,#6b6b65)" transform="rotate(-90,{tx},{cy})">{u}</text>'.format(
+            tx=g.y_title_x, cy=round(mt + plot_h / 2), u=_esc(unit)))
 
     # Bars
     n = len(nodes)
@@ -1890,8 +1997,8 @@ def _svg_single_bar(nodes, node_values, unit, color):
         if val <= 0:
             continue
         bar_h = (val - y_min) / (y_max - y_min) * plot_h
-        bx = _ML + i * bar_w + gap
-        by = _MT + plot_h - bar_h
+        bx = ml + i * bar_w + gap
+        by = mt + plot_h - bar_h
         parts.append(
             '<rect x="{x}" y="{y}" width="{bw}" height="{bh}" '
             'fill="{c}" rx="2">'
@@ -1902,21 +2009,24 @@ def _svg_single_bar(nodes, node_values, unit, color):
                 c=color, node=_esc(node),
                 val=_esc(_fmt_tick(val)), unit=_esc(unit)))
 
-    # X-axis labels
+    # X-axis labels (T25: a compact chart labels at most every k-th node)
     rotate = n > 10
+    step = _label_step(n, _COMPACT_MAX_X_LABELS) if compact else 1
     for i, node in enumerate(nodes):
-        cx = _ML + i * bar_w + bar_w / 2
+        if i % step:
+            continue
+        cx = ml + i * bar_w + bar_w / 2
         if rotate:
             parts.append(
                 '<text x="{x}" y="{y}" text-anchor="end" font-size="11" '
                 'fill="var(--muted,#6b6b65)" '
                 'transform="rotate(-45,{x},{y})">{n}</text>'.format(
-                    x=round(cx, 1), y=h - _MB + 14, n=_esc(node)))
+                    x=round(cx, 1), y=h - mb + 14, n=_esc(node)))
         else:
             parts.append(
                 '<text x="{x}" y="{y}" text-anchor="middle" font-size="12" '
                 'fill="var(--muted,#6b6b65)">{n}</text>'.format(
-                    x=round(cx, 1), y=h - _MB + 16, n=_esc(node)))
+                    x=round(cx, 1), y=h - mb + 16, n=_esc(node)))
 
     parts.append('</svg>')
     return "\n".join(parts)
@@ -1951,6 +2061,8 @@ def _build_bench_section(bench_id, bs, outlier_hosts, threshold, node_map=None,
     letter = chr(97 + bench_id) if bench_id < 26 else str(bench_id)
 
     # ----- Build chart area -----
+    # T4: every subtitle names population (GPU), statistic and metric.
+    # Temperature is the per-GPU run max (GPUResult.temp_max_c), not a mean.
     panels = []  # type: list  # (subtitle, svg_html)
     if all_perf:
         n_bins = 40
@@ -1959,45 +2071,31 @@ def _build_bench_section(bench_id, bs, outlier_hosts, threshold, node_map=None,
         if len(all_perf) < 10:
             n_bins = len(all_perf)
         if dot_plot:
-            panels.append(("Performance ({})".format(unit),
+            panels.append(("Fleet distribution of GPU mean performance ({})".format(unit),
                            chart_fn(all_perf, unit, bs.fleet_mean,
                                     n_bins=n_bins, threshold_pct=threshold,
                                     results=bs.results)))
         else:
-            panels.append(("Performance ({})".format(unit),
+            panels.append(("Fleet distribution of GPU mean performance ({})".format(unit),
                            chart_fn(all_perf, unit, bs.fleet_mean,
                                     n_bins=n_bins, threshold_pct=threshold)))
 
-    if all_power:
-        _n = min(20, max(5, len(all_power) // 3))
-        panels.append(("Power (W)",
-                      chart_fn(all_power, "W",
-                               statistics.mean(all_power),
-                               n_bins=_n)))
-    if all_temp:
-        _n = min(20, max(5, len(all_temp) // 3))
-        panels.append(("Temperature (\u00b0C)",
-                      chart_fn(all_temp, "\u00b0C",
-                               statistics.mean(all_temp),
-                               n_bins=_n)))
-    if all_sm_util:
-        _n = min(20, max(5, len(all_sm_util) // 3))
-        panels.append(("SM Utilization (%)",
-                      chart_fn(all_sm_util, "%",
-                               statistics.mean(all_sm_util),
-                               n_bins=_n)))
-    if all_mem_bw:
-        _n = min(20, max(5, len(all_mem_bw) // 3))
-        panels.append(("Memory BW Utilization (%)",
-                      chart_fn(all_mem_bw, "%",
-                               statistics.mean(all_mem_bw),
-                               n_bins=_n)))
-    if all_gpu_clock:
-        _n = min(20, max(5, len(all_gpu_clock) // 3))
-        panels.append(("GPU Clock (MHz)",
-                      chart_fn(all_gpu_clock, "MHz",
-                               statistics.mean(all_gpu_clock),
-                               n_bins=_n)))
+    # T24/T26: the performance chart stays full size; the diagnostic panels
+    # beside it are compact small multiples.
+    diagnostics = [
+        (all_power, "W", "Fleet distribution of GPU mean power (W)"),
+        (all_temp, "\u00b0C", "Fleet distribution of GPU max temperature (\u00b0C)"),
+        (all_sm_util, "%", "Fleet distribution of GPU mean SM utilization (%)"),
+        (all_mem_bw, "%", "Fleet distribution of GPU mean memory BW utilization (%)"),
+        (all_gpu_clock, "MHz", "Fleet distribution of GPU mean GPU clock (MHz)"),
+    ]
+    for values, metric_unit, subtitle in diagnostics:
+        if not values:
+            continue
+        panels.append((subtitle,
+                       chart_fn(values, metric_unit, statistics.mean(values),
+                                n_bins=min(20, max(5, len(values) // 3)),
+                                compact=True)))
 
     if len(panels) == 1:
         chart_area = (
@@ -2021,7 +2119,8 @@ def _build_bench_section(bench_id, bs, outlier_hosts, threshold, node_map=None,
     else:
         chart_area = ""
 
-    # Percentile stats for large fleets
+    # Stats line (T1): mean is the headline; median precedes the p5/p95
+    # interval so the robust centre is read before its spread.
     stats_parts = ["fleet mean: {} {}".format(_fmt_html(bs.fleet_mean, 1), unit)]
     if bs.fleet_cv > 0:
         stats_parts.append("CV: {:.1f}%".format(bs.fleet_cv))
@@ -2030,11 +2129,10 @@ def _build_bench_section(bench_id, bs, outlier_hosts, threshold, node_map=None,
         p5 = sorted_vals[int(len(sorted_vals) * 0.05)]
         p50 = sorted_vals[int(len(sorted_vals) * 0.50)]
         p95 = sorted_vals[int(len(sorted_vals) * 0.95)]
-        stats_parts.append("p5: {}".format(_fmt_html(p5)))
         stats_parts.append("median: {}".format(_fmt_html(p50)))
-        stats_parts.append("p95: {}".format(_fmt_html(p95)))
+        stats_parts.append("p5/p95: {}/{}".format(_fmt_html(p5), _fmt_html(p95)))
     if bs.power_values:
-        stats_parts.append("avg power: {:.0f}W".format(statistics.mean(bs.power_values)))
+        stats_parts.append("mean power: {:.0f}W".format(statistics.mean(bs.power_values)))
     if bs.temp_values:
         stats_parts.append("max temp: {:.0f} C".format(max(bs.temp_values)))
     if bs.throttled_results:
@@ -2072,7 +2170,7 @@ def _build_bench_section(bench_id, bs, outlier_hosts, threshold, node_map=None,
         '        <th class="sortable" data-col="0">node</th>\n'
         '{loc_header}'
         '        {gpu_headers}\n'
-        '        <th class="sortable" data-col="{avg_col}">node avg</th>\n'
+        '        <th class="sortable" data-col="{avg_col}">node mean</th>\n'
         '        <th class="sortable" data-col="{vs_col}" title="% deviation from fleet mean performance">vs fleet</th>\n'
         '        <th class="sortable" data-col="{thrt_col}" title="Thermal throttling detected">thrt</th>\n'
         '      </tr></thead>\n'
@@ -2451,10 +2549,6 @@ def _render_interactive_html(results, bench_stats, outliers, source_name, thresh
 
     has_iteration_data = bool(_iteration_data)
 
-    # Escape </ in JSON to prevent </script> tag injection (standard XSS mitigation)
-    def _safe_json(obj):
-        return json.dumps(obj).replace("</", "<\\/")
-
     results_json = _safe_json(results_data)
     results_cols_json = _safe_json(_results_cols)
     stats_json = _safe_json(stats_data)
@@ -2623,14 +2717,14 @@ def _render_interactive_html(results, bench_stats, outliers, source_name, thresh
     # Chart sections
     parts.append('  <div class="chart-section">\n')
     parts.append('    <h2>Fleet Map</h2>\n')
-    parts.append('    <div class="chart-subtitle">Spots topology-correlated problems. Uniform color = healthy fleet. Clusters of red/blue within a cabinet = localized issue (cooling, power, hardware fault).</div>\n')
+    parts.append('    <div class="chart-subtitle">Each square uses the node mean of the selected metric. Spots topology-correlated problems. Uniform color = healthy fleet. Clusters of red/blue within a cabinet = localized issue (cooling, power, hardware fault).</div>\n')
     parts.append('    <div id="fleetmap-legend" style="font-size:11px;color:var(--muted);margin-bottom:8px"></div>\n')
     parts.append('    <div id="fleetmap-chart" style="padding:0.5rem 0"></div>\n')
     parts.append('  </div>\n')
 
     parts.append('  <div class="chart-section">\n')
     parts.append('    <h2>Fleet Distribution</h2>\n')
-    parts.append('    <div class="chart-subtitle">Tight bell curve = consistent fleet. Long tails or secondary peaks = subpopulations worth investigating. GPUs beyond \u00b12\u03c3 (red) are statistical outliers.</div>\n')
+    parts.append('    <div class="chart-subtitle">Distribution of GPU mean of the selected metric (GPU max for temperature). Tight bell curve = consistent fleet. Long tails or secondary peaks = subpopulations worth investigating. GPUs beyond \u00b12\u03c3 (red) are statistical outliers.</div>\n')
     parts.append('    <div id="distribution-chart" class="chart-div"></div>\n')
     parts.append('  </div>\n')
 
@@ -2673,7 +2767,7 @@ def _render_interactive_html(results, bench_stats, outliers, source_name, thresh
     parts.append('      <select id="waterfall-sort" style="background:var(--surface2);color:var(--text);'
                  'border:1px solid var(--border2);border-radius:4px;padding:4px 8px;font-size:12px">\n')
     parts.append('        <option value="topology">Topology</option>\n')
-    parts.append('        <option value="performance">By Performance</option>\n')
+    parts.append('        <option value="performance">By value (ascending)</option>\n')
     parts.append('        <option value="hostname">By Hostname</option>\n')
     parts.append('      </select>\n')
     parts.append('    </div>\n')
@@ -2769,7 +2863,19 @@ function metricUnit(data, m) {
   if (m === "mean_val" && data.length > 0) return data[0].unit || "";
   return {"power_avg_w":"W","temp_max_c":"\\u00b0C","sm_util_mean":"%","mem_bw_util_mean":"%","gpu_clock_mean":"MHz"}[m] || "";
 }
+// Vocabulary (T7, T11): labels name the statistic and its population.
+// metricNoun is the sentence-case metric name; metricStatistic is the per-GPU
+// statistic behind each summary column (temperature is the run max).
+function metricNoun(m) {
+  return {"mean_val":"performance","power_avg_w":"power","temp_max_c":"temperature",
+    "sm_util_mean":"SM utilization","mem_bw_util_mean":"memory BW utilization","gpu_clock_mean":"GPU clock"}[m] || m;
+}
+function metricStatistic(m) { return m==="temp_max_c"?"max":"mean"; }
 function isLowerBetter(m) { return m==="temp_max_c"||m==="power_avg_w"||m==="temp_gpu_C"||m==="power_W"; }
+// T13: every value-ordered view sorts ascending left-to-right regardless of
+// metric direction; colour and status carry good/bad. isLowerBetter above is
+// kept for outlier direction and legend wording only (T14), never for order.
+function ascByMean(getMean) { return function(a,b){ return getMean(a)-getMean(b); }; }
 function arrStats(arr) {
   if (!arr.length) return {mean:0,std:0,min:0,max:0,median:0};
   var n=arr.length, mean=arr.reduce(function(s,v){return s+v;},0)/n;
@@ -2777,6 +2883,24 @@ function arrStats(arr) {
   var sorted=arr.slice().sort(function(a,b){return a-b;});
   var median=n%2?sorted[(n-1)/2]:(sorted[Math.floor(n/2)-1]+sorted[Math.floor(n/2)])/2;
   return {mean:mean,std:std,min:sorted[0],max:sorted[n-1],median:median};
+}
+function quantile(sortedArr,q) {
+  if (!sortedArr.length) return null;
+  var pos=(sortedArr.length-1)*q, lo=Math.floor(pos), hi=Math.ceil(pos);
+  return sortedArr[lo]+(sortedArr[hi]-sortedArr[lo])*(pos-lo);
+}
+// T21: colour domain per metric. Utilisation is a bounded percentage, so its
+// scale is fixed 0-100; open-ended metrics use the p2-p98 of the non-null
+// cells so a handful of zeros or spikes cannot flatten the rest.
+var BOUNDED_PERCENT_METRICS={sm_util:true,mem_bw_util:true};
+function colourDomain(metricKey,samples) {
+  if (BOUNDED_PERCENT_METRICS[metricKey]) return [0,100];
+  if (!samples.length) return [0,1];
+  var sorted=samples.slice().sort(function(a,b){return a-b;});
+  var lo=quantile(sorted,0.02), hi=quantile(sorted,0.98);
+  if (hi<=lo) { lo=sorted[0]; hi=sorted[sorted.length-1]; }
+  if (hi<=lo) hi=lo+1;
+  return [lo,hi];
 }
 function mkOutlierSet() {
   // Sigma-based outlier detection for interactive exploration.
@@ -2915,6 +3039,7 @@ function renderFleetMap() {
   var allVals=[];
   Object.keys(nodeVals).forEach(function(h){allVals.push(nodeVals[h].sum/nodeVals[h].n);});
   var st=arrStats(allVals);
+  function nodeMeanOf(h){ var nv=nodeVals[h]; return nv?nv.sum/nv.n:0; }
   // Propagate per-GPU outlier status to nodes (consistent with header card and other charts)
   data.forEach(function(r){
     var sk=r.hostname+":"+r.gpu;
@@ -3079,28 +3204,20 @@ function renderFleetMap() {
       });
       html+='</div>';
     } else {
-      // NODE_MAP without parseable xnames: flat grid sorted by performance
+      // NODE_MAP without parseable xnames: flat grid, ascending node mean (T15)
       var totalNodes=allHosts.length;
       var sqSize=totalNodes>500?10:totalNodes>200?14:totalNodes>80?18:22;
-      allHosts.sort(function(a,b){
-        var va=nodeVals[a]?nodeVals[a].sum/nodeVals[a].n:0;
-        var vb=nodeVals[b]?nodeVals[b].sum/nodeVals[b].n:0;
-        return lowerBetter?va-vb:vb-va;
-      });
+      allHosts.sort(ascByMean(nodeMeanOf));
       var cols=Math.min(20,Math.ceil(Math.sqrt(totalNodes)*1.5));
       html+='<div style="display:grid;grid-template-columns:repeat('+cols+','+sqSize+'px);gap:3px;justify-content:center">';
       allHosts.forEach(function(h){ html+=mkSquare(h,sqSize); });
       html+='</div>';
     }
   } else {
-    // No grouping info: flat grid sorted by performance
+    // No grouping info: flat grid, ascending node mean (T15)
     var totalNodes=allHosts.length;
     var sqSize=totalNodes>500?10:totalNodes>200?14:totalNodes>80?18:22;
-    allHosts.sort(function(a,b){
-      var va=nodeVals[a]?nodeVals[a].sum/nodeVals[a].n:0;
-      var vb=nodeVals[b]?nodeVals[b].sum/nodeVals[b].n:0;
-      return lowerBetter?va-vb:vb-va;
-    });
+    allHosts.sort(ascByMean(nodeMeanOf));
     var cols=Math.min(20,Math.ceil(Math.sqrt(totalNodes)*1.5));
     html+='<div style="display:grid;grid-template-columns:repeat('+cols+','+sqSize+'px);gap:3px;justify-content:center">';
     allHosts.forEach(function(h){ html+=mkSquare(h,sqSize); });
@@ -3161,7 +3278,7 @@ function renderDistribution() {
   // Stats legend: upper-right, compact
   var tc=themeColors();
   var legendLines=[
-    "\\u03bc = "+st.mean.toFixed(2)+" "+unit,
+    "mean = "+st.mean.toFixed(2)+" "+unit,
     "\\u03c3 = "+st.std.toFixed(2)+" "+unit,
     "kurtosis = "+kurt.toFixed(2),
     "n = "+vals.length
@@ -3228,12 +3345,12 @@ function renderEfficiency() {
     {type:"line",y0:mSt.mean,y1:mSt.mean,x0:0,x1:1,xref:"paper",line:{color:"rgba(255,255,255,0.15)",width:1,dash:"dash"}}
   ];
   var ann = [
-    {x:pSt.mean,y:1.02,yref:"paper",text:"avg power",showarrow:false,font:{size:9,color:"#5f6368"},yanchor:"bottom"},
-    {x:0,xref:"paper",y:mSt.mean,text:" avg "+metricLabel(metric).toLowerCase(),showarrow:false,font:{size:9,color:"#5f6368"},xanchor:"left"}
+    {x:pSt.mean,y:1.02,yref:"paper",text:"mean power",showarrow:false,font:{size:9,color:"#5f6368"},yanchor:"bottom"},
+    {x:0,xref:"paper",y:mSt.mean,text:" mean "+metricNoun(metric),showarrow:false,font:{size:9,color:"#5f6368"},xanchor:"left"}
   ];
   var layout = Object.assign({},baseLayout,{
     shapes:shapes,annotations:ann,
-    xaxis:tAxis({title:tAxisTitle("Average Power (W)")}),
+    xaxis:tAxis({title:tAxisTitle("Mean power (W)")}),
     yaxis:tAxis({title:tAxisTitle(axisTitle(metric,unit))}),
     height:420,margin:{t:36,b:56,l:72,r:80}
   });
@@ -3258,10 +3375,8 @@ function renderStrip() {
     var vals=byNode[h].map(function(r){return r[metric];});
     nodeMeans[h]=arrStats(vals).mean;
   });
-  var lowerBetter = isLowerBetter(metric);
-  nodeNames.sort(function(a,b) {
-    return lowerBetter?nodeMeans[a]-nodeMeans[b]:nodeMeans[b]-nodeMeans[a];
-  });
+  // T16: ascending node mean; truncation below keeps both ends + abnormal nodes.
+  nodeNames.sort(ascByMean(function(h){ return nodeMeans[h]; }));
   var MAX_DISPLAY = 60;
   var truncated=false, displayNodes=nodeNames;
   if (nodeNames.length > MAX_DISPLAY) {
@@ -3305,11 +3420,11 @@ function renderStrip() {
   });
   var shapes=[{type:"line",y0:fleetMean,y1:fleetMean,x0:-0.5,x1:displayNodes.length-0.5,
     line:{color:"#5dcaa5",width:1.5,dash:"dash"}}];
-  var ann=[{x:displayNodes.length-0.5,y:fleetMean,text:"fleet: "+fleetMean.toFixed(1)+" "+unit,
+  var ann=[{x:displayNodes.length-0.5,y:fleetMean,text:"fleet mean: "+fleetMean.toFixed(1)+" "+unit,
     showarrow:false,font:{size:10,color:"#5dcaa5"},xanchor:"left"}];
   if (truncated) {
     ann.push({x:0.5,y:1.02,xref:"paper",yref:"paper",
-      text:"showing "+displayNodes.length+" of "+nodeNames.length+" nodes (top/bottom + outliers)",
+      text:"showing "+displayNodes.length+" of "+nodeNames.length+" nodes (lowest/highest + outliers)",
       showarrow:false,font:{size:10,color:"#5f6368"}});
   }
   var maxHostLen=displayNodes.reduce(function(mx,n){return Math.max(mx,n.length);},0);
@@ -3317,7 +3432,7 @@ function renderStrip() {
   var layout = Object.assign({},baseLayout,{
     shapes:shapes,annotations:ann,showlegend:true,
     legend:{bgcolor:"rgba(0,0,0,0)",font:{color:themeColors().axis,size:11},orientation:"h",x:0,y:1.12},
-    xaxis:tAxis({title:{text:"Node (sorted by mean, "+displayNodes.length+(truncated?" of "+nodeNames.length:"")+" nodes)",standoff:4,font:{size:11,color:themeColors().axis}},
+    xaxis:tAxis({title:{text:"Node, ascending node mean ("+displayNodes.length+(truncated?" of "+nodeNames.length:"")+" nodes)",standoff:4,font:{size:11,color:themeColors().axis}},
       tickmode:"array",tickvals:dn>50?[]:displayNodes.map(function(_,i){return i;}),
       ticktext:dn>50?[]:displayNodes,tickangle:dn>25?-60:-45,
       tickfont:{size:dn>30?9:10}}),
@@ -3328,13 +3443,15 @@ function renderStrip() {
 }
 
 // Rolling mean smoother for individual traces (removes iteration noise after downsampling).
+// T19: null samples are gaps. They are skipped inside the window; a window
+// with no samples stays null so Plotly breaks the line instead of drawing 0.
 function smoothArr(arr,w){
   if(!w||w<2||arr.length<=w) return arr;
   var out=[],hw=Math.floor(w/2);
   for(var i=0;i<arr.length;i++){
-    var lo=Math.max(0,i-hw),hi=Math.min(arr.length-1,i+hw),s=0;
-    for(var j=lo;j<=hi;j++) s+=arr[j];
-    out.push(s/(hi-lo+1));
+    var lo=Math.max(0,i-hw),hi=Math.min(arr.length-1,i+hw),s=0,n=0;
+    for(var j=lo;j<=hi;j++){ if(arr[j]!=null){ s+=arr[j]; n++; } }
+    out.push(n?s/n:null);
   }
   return out;
 }
@@ -3350,7 +3467,8 @@ function dsIters(iters,arrs,modes){
     var end=Math.min(b+binSz,n);
     ox.push(iters[b]);
     for(var ai=0;ai<arrs.length;ai++){
-      var sl=arrs[ai].slice(b,end);
+      var sl=arrs[ai].slice(b,end).filter(function(v){return v!=null;});
+      if(!sl.length){ oa[ai].push(null); continue; }  // T19: all-gap bin stays a gap
       sl.sort(function(a,b){return a-b;});
       var m=modes[ai]||"median";
       if(m==="min") oa[ai].push(sl[0]);
@@ -3380,7 +3498,7 @@ function renderTimeSeries() {
     if(host!=="all"&&h!==host) return;
     if(bench!=="all"&&lbl!==bench) return;
     var rows=ITER_DATA[key];
-    var ys=rows.map(function(r){return r[mKey];}).filter(function(v){return v!=null&&v>0;});
+    var ys=rows.map(function(r){return r[mKey];}).filter(function(v){return v!=null;});  // T19
     if(!ys.length) return;
     var status="normal";
     if(oSet[h+":"+g])status="outlier-"+oSet[h+":"+g]; else if(tSet[h+":"+g])status="throttled";
@@ -3392,7 +3510,7 @@ function renderTimeSeries() {
     var iterBuckets={};
     allSeries.forEach(function(s){
       s.rows.forEach(function(r){
-        var v=r[mKey]; if(v==null||v<=0) return;
+        var v=r[mKey]; if(v==null) return;  // T19: a measured 0 is data
         if(!iterBuckets[r.iteration]) iterBuckets[r.iteration]=[];
         iterBuckets[r.iteration].push(v);
       });
@@ -3421,8 +3539,8 @@ function renderTimeSeries() {
     traces.push({x:iters,y:p10s,type:"scatter",mode:"lines",line:{color:"rgba(0,114,178,0.35)",width:0.5},showlegend:false,hoverinfo:"skip"});
     traces.push({
       x:iters,y:medians,type:"scatter",mode:"lines",
-      line:{color:"#0072B2",width:2},name:"fleet median",
-      hovertemplate:"Iteration %{x}<br>Median: %{y:.1f} "+unit+"<extra></extra>"
+      line:{color:"#0072B2",width:2},name:"fleet median across GPUs",
+      hovertemplate:"Iteration %{x}<br>fleet median: %{y:.1f} "+unit+"<extra></extra>"
     });
     // Only show individual traces for outlier/throttled GPUs
     var abnormal=allSeries.filter(function(s){return s.status!=="normal";});
@@ -3431,7 +3549,7 @@ function renderTimeSeries() {
     // Compute fleet mean for deviation labels
     var fleetSum=0,fleetN=0;
     allSeries.forEach(function(s){
-      s.rows.forEach(function(r){var v=r[mKey];if(v!=null&&v>0){fleetSum+=v;fleetN++;}});
+      s.rows.forEach(function(r){var v=r[mKey];if(v!=null){fleetSum+=v;fleetN++;}});
     });
     var fleetMean=fleetN>0?fleetSum/fleetN:0;
     if (abnormal.length <= 20) {
@@ -3442,7 +3560,7 @@ function renderTimeSeries() {
         sy=smoothArr(sy,15);
         // Compute GPU mean deviation for legend label
         var gSum=0,gN=0;
-        s.rows.forEach(function(r){var v=r[mKey];if(v!=null&&v>0){gSum+=v;gN++;}});
+        s.rows.forEach(function(r){var v=r[mKey];if(v!=null){gSum+=v;gN++;}});
         var gMean=gN>0?gSum/gN:0;
         var devPct=fleetMean>0?((gMean-fleetMean)/fleetMean*100).toFixed(1):"?";
         var devStr=(parseFloat(devPct)>0?"+":"")+devPct+"%";
@@ -3461,14 +3579,15 @@ function renderTimeSeries() {
       abnormal.forEach(function(s){
         var bucket=s.status.indexOf("outlier")===0?abnBuckets.out:abnBuckets.thr;
         s.rows.forEach(function(r){
-          var v=r[mKey]; if(v==null||v<=0) return;
+          var v=r[mKey]; if(v==null) return;  // T19
           if(!bucket[r.iteration]) bucket[r.iteration]=[];
           bucket[r.iteration].push(v);
         });
       });
-      [["out","#f09595","rgba(240,149,149,0.12)",nOut+" outlier GPU(s)"],
-       ["thr","#fbbf24","rgba(251,191,36,0.12)",nThr+" throttled GPU(s)"]].forEach(function(cfg){
-        var bk=abnBuckets[cfg[0]];
+      // cfg: [bucket, line colour, fill colour, population noun, GPU count]
+      [["out","#f09595","rgba(240,149,149,0.12)","outlier",nOut],
+       ["thr","#fbbf24","rgba(251,191,36,0.12)","throttled",nThr]].forEach(function(cfg){
+        var bk=abnBuckets[cfg[0]],population=cfg[3],nGpus=cfg[4];
         var rawBi=Object.keys(bk).map(Number).sort(function(a,b){return a-b;});
         if(!rawBi.length) return;
         var rawBp10=[],rawBp50=[],rawBp90=[];
@@ -3486,12 +3605,12 @@ function renderTimeSeries() {
           y:bp90.concat(bp10.slice().reverse()),
           type:"scatter",fill:"toself",mode:"none",
           fillcolor:cfg[2],
-          name:cfg[3]+" p10\\u2013p90",showlegend:true,hoverinfo:"skip"
+          name:nGpus+" "+population+" GPU(s) p10\\u2013p90",showlegend:true,hoverinfo:"skip"
         });
         traces.push({
           x:bi,y:bp50,type:"scatter",mode:"lines",
-          line:{color:cfg[1],width:1.5},name:cfg[3]+" median",
-          hovertemplate:"Iteration %{x}<br>Median: %{y:.1f} "+unit+"<extra></extra>"
+          line:{color:cfg[1],width:1.5},name:population+" GPU median ("+nGpus+" GPUs)",
+          hovertemplate:"Iteration %{x}<br>"+population+" GPU median: %{y:.1f} "+unit+"<extra></extra>"
         });
       });
     }
@@ -3527,9 +3646,10 @@ function renderWaterfall() {
   var bench=document.getElementById("filter-bench").value;
   // Waterfall has its own metric selector (iter-level keys), independent of summary metric
   var wfMetric=document.getElementById("waterfall-metric").value;
-  var wfMetricLabels={"performance":"Performance","temp_gpu_C":"Temperature",
-    "gpu_clock":"GPU Clock","sm_util":"SM Utilization",
-    "mem_bw_util":"Memory BW Utilization","power_W":"Power"};
+  // Sentence-case nouns: they are composed into title/hover/axis text (T10).
+  var wfMetricLabels={"performance":"performance","temp_gpu_C":"temperature",
+    "gpu_clock":"GPU clock","sm_util":"SM utilization",
+    "mem_bw_util":"memory BW utilization","power_W":"power"};
   var wfMetricUnits={"performance":"","temp_gpu_C":"\u00b0C",
     "gpu_clock":"MHz","sm_util":"%","mem_bw_util":"%","power_W":"W"};
   var mKey=wfMetric;
@@ -3539,7 +3659,7 @@ function renderWaterfall() {
   var unit=wfMetric==="performance"?metricUnit(RESULTS,metric):wfMetricUnits[wfMetric];
   var oSet=mkOutlierSet(),tSet=mkThrottleSet();
   var wfTitle=document.getElementById("waterfall-title");
-  if(wfTitle) wfTitle.textContent="Fleet Waterfall \u2014 "+mLabel;
+  if(wfTitle) wfTitle.textContent="Fleet Waterfall \u2014 mean "+mLabel+" per iteration";
   // Gather all GPU series
   var gpuSeries=[];
   Object.keys(ITER_DATA).forEach(function(key) {
@@ -3549,7 +3669,7 @@ function renderWaterfall() {
     if(bench!=="all"&&lbl!==bench) return;
     var rows=ITER_DATA[key];
     var vals=rows.map(function(r){return r[mKey];});
-    var valid=vals.filter(function(v){return v!=null&&v>0;});
+    var valid=vals.filter(function(v){return v!=null;});  // T19: zeros count, nulls are gaps
     if(!valid.length) return;
     var mean=valid.reduce(function(s,v){return s+v;},0)/valid.length;
     var status="normal";
@@ -3577,8 +3697,8 @@ function renderWaterfall() {
   }
   if (sortMode==="topology") { gpuSeries.sort(topoSort); }
   else if (sortMode==="performance") {
-    var lb=isLowerBetter(wfMetric);
-    gpuSeries.sort(function(a,b){return lb?a.mean-b.mean:b.mean-a.mean;});
+    // T17: ascending column mean of the selected waterfall metric
+    gpuSeries.sort(ascByMean(function(s){ return s.mean; }));
   } else {
     gpuSeries.sort(function(a,b){
       if(a.host!==b.host) return a.host<b.host?-1:a.host>b.host?1:0;
@@ -3590,7 +3710,7 @@ function renderWaterfall() {
   var useNodeAgg=gpuSeries.length>100;
   var entityLabel=useNodeAgg?"node":"GPU";
   var sub=document.getElementById("waterfall-subtitle");
-  if(sub) sub.textContent="Vertical stripes = consistent per-"+entityLabel+" difference. Horizontal bands = all "+entityLabel+"s affected simultaneously. Uniform color = healthy fleet.";
+  if(sub) sub.textContent="Vertical stripes = consistent per-"+entityLabel+" difference. Horizontal bands = all "+entityLabel+"s affected simultaneously. Uniform color = healthy fleet. Cells show the measured (or downsampled mean) value; the top line shows the latest iteration per column.";
   if(useNodeAgg){
     var byNode={};
     gpuSeries.forEach(function(s){
@@ -3605,12 +3725,12 @@ function renderWaterfall() {
     if(sortMode==="topology"){
       nodeKeys.sort(function(a,b){return topoSort(byNode[a].series[0],byNode[b].series[0]);});
     } else if(sortMode==="performance"){
-      var lb2=isLowerBetter(wfMetric);
-      nodeKeys.sort(function(a,b){
-        var ma=byNode[a].series.reduce(function(s,g){return s+g.mean;},0)/byNode[a].series.length;
-        var mb=byNode[b].series.reduce(function(s,g){return s+g.mean;},0)/byNode[b].series.length;
-        return lb2?ma-mb:mb-ma;
-      });
+      // T18: ascending node mean of the constituent GPU means
+      var nodeMeanOfGpuMeans=function(h){
+        var series=byNode[h].series;
+        return series.reduce(function(s,g){return s+g.mean;},0)/series.length;
+      };
+      nodeKeys.sort(ascByMean(nodeMeanOfGpuMeans));
     } else { nodeKeys.sort(); }
     nodeKeys.forEach(function(h){columns.push(byNode[h]);});
   } else {
@@ -3639,58 +3759,70 @@ function renderWaterfall() {
     zMatrix[yi]=new Float64Array(nCols);
     zCounts[yi]=new Uint16Array(nCols);
   }
-  // Fill z-matrix (accumulate for averaging when aggregating or downsampling)
+  // Fill z-matrix (accumulate for averaging when aggregating or downsampling).
+  // T19/T20: a measured 0 is a sample and is averaged in; only null is a gap.
   columns.forEach(function(col,xi){
     col.series.forEach(function(s){
       s.rows.forEach(function(r){
         var yi=Math.floor(r.iteration/step);
         if(yi>=iterCount) return;
         var v=r[mKey];
-        if(v!=null&&v>0){
+        if(v!=null){
           zMatrix[yi][xi]+=v;
           zCounts[yi][xi]++;
         }
       });
     });
   });
-  // Convert sums to averages; replace 0-counts with null for gaps
-  var zOut=[];
+  // Convert sums to averages; cells with no samples become null (a gap, T20)
+  var zOut=[],zSamples=[];
   for(var yi=0;yi<iterCount;yi++){
     var row=new Array(nCols);
     for(var xi=0;xi<nCols;xi++){
-      row[xi]=zCounts[yi][xi]>0?zMatrix[yi][xi]/zCounts[yi][xi]:null;
+      if(zCounts[yi][xi]>0){ row[xi]=zMatrix[yi][xi]/zCounts[yi][xi]; zSamples.push(row[xi]); }
+      else row[xi]=null;
     }
     zOut.push(row);
   }
-  // SDR-style colorscale: dark blue -> cyan -> yellow -> red -> white
+  // T21: metric-specific colour domain. Utilisation is bounded 0-100; other
+  // metrics span the p2-p98 of non-null cells so a few zeros or spikes do not
+  // flatten the colour structure of the rest.
+  var zRange=colourDomain(wfMetric,zSamples);
+  // SDR-style colorscale: dark blue -> cyan -> yellow -> red -> white.
+  // Null cells render transparent (page background), which is outside this
+  // palette, so "no data" is visually distinct from the lowest value (T20).
   var colorscale=[
     [0.00,"#000033"],[0.15,"#0000aa"],[0.30,"#0066cc"],
     [0.45,"#00cccc"],[0.60,"#66cc00"],[0.75,"#cccc00"],
     [0.88,"#cc3300"],[0.95,"#ff3300"],[1.00,"#ffffff"]
   ];
-  // Compute latest-iteration value per column for spectrum trace (top panel).
+  // Latest-iteration value per column for the spectrum trace (top panel).
   // In waterfall convention the spectrum shows the most recent sweep.
+  // T22: a column whose GPUs have no non-null sample yields null, which
+  // breaks the line there instead of plotting a fictitious 0.
   var colLatest=columns.map(function(c){
     var sum=0,cnt=0;
     c.series.forEach(function(s){
-      var latestIter=-1,latestVal=0;
+      var latestIter=-1,latestVal=null,hasLatest=false;
       s.rows.forEach(function(r){
-        var v=r[mKey]; if(v!=null&&v>0&&r.iteration>latestIter){latestIter=r.iteration;latestVal=v;}
+        var v=r[mKey]; if(v!=null&&r.iteration>latestIter){latestIter=r.iteration;latestVal=v;hasLatest=true;}
       });
-      if(latestVal>0){sum+=latestVal;cnt++;}
+      if(hasLatest){sum+=latestVal;cnt++;}
     });
-    return cnt>0?sum/cnt:0;
+    return cnt>0?sum/cnt:null;
   });
-  var fleetMean=colLatest.reduce(function(s,v){return s+v;},0)/colLatest.length;
+  var latestPresent=colLatest.filter(function(v){return v!=null;});
+  var fleetMean=latestPresent.length?latestPresent.reduce(function(s,v){return s+v;},0)/latestPresent.length:0;
   var spectrumTrace={
     x:xLabels,y:colLatest,
     type:"scatter",
     mode:"lines",
+    connectgaps:false,
     line:{color:"#0072B2",width:1.5},
     fill:"tozeroy",
     fillcolor:"rgba(0,114,178,0.15)",
     yaxis:"y2",
-    hovertemplate:"%{x}<br>Latest "+mLabel+": %{y:.1f} "+unit+"<extra></extra>",
+    hovertemplate:"%{x}<br>Latest iteration "+mLabel+": %{y:.1f} "+unit+"<extra></extra>",
     showlegend:false
   };
   // Fleet mean line on spectrum panel
@@ -3703,6 +3835,8 @@ function renderWaterfall() {
   var trace={
     z:zOut,x:xLabels,y:yLabels,
     type:"heatmap",colorscale:colorscale,
+    zmin:zRange[0],zmax:zRange[1],
+    hoverongaps:false,
     hovertemplate:"%{x}<br>Iter %{y}<br>"+mLabel+": %{z:.1f} "+unit+"<extra></extra>",
     colorbar:{title:{text:mLabel,side:"right"},thickness:14,len:0.6,y:0.3,
       tickfont:{size:10,color:themeColors().axis},titlefont:{size:11,color:themeColors().axis}},
@@ -3733,6 +3867,9 @@ function renderWaterfall() {
   var xAxisCfg=tAxis({
     side:"bottom",showgrid:false,zeroline:false,showline:false,ticks:""
   });
+  // T13/T17/T18: the "performance" sort mode is an ascending sort on the
+  // selected metric's column mean, so name it that way on the axis.
+  var sortLabel=sortMode==="performance"?"ascending "+mLabel:sortMode;
   if(sortMode==="topology"&&annotations.length>0){
     // Topology mode with group labels: hide per-GPU ticks, group annotations provide context
     xAxisCfg.showticklabels=false;
@@ -3741,7 +3878,7 @@ function renderWaterfall() {
     xAxisCfg.showticklabels=true;
     xAxisCfg.tickangle=-45;
     xAxisCfg.tickfont={size:10};
-    xAxisCfg.title={text:(useNodeAgg?"Node":"GPU")+" (sorted by "+sortMode+")",font:{size:11,color:themeColors().axis}};
+    xAxisCfg.title={text:(useNodeAgg?"Node":"GPU")+" (sorted by "+sortLabel+")",font:{size:11,color:themeColors().axis}};
   } else {
     // Large fleet, non-topology: show every Nth label
     var every=Math.ceil(nCols/20);
@@ -3753,8 +3890,15 @@ function renderWaterfall() {
     xAxisCfg.ticktext=tText;
     xAxisCfg.tickangle=-45;
     xAxisCfg.tickfont={size:9};
-    xAxisCfg.title={text:(useNodeAgg?"Node":"GPU")+" ("+nCols+(useNodeAgg?" nodes":" GPUs")+", sorted by "+sortMode+")",
+    xAxisCfg.title={text:(useNodeAgg?"Node":"GPU")+" ("+nCols+(useNodeAgg?" nodes":" GPUs")+", sorted by "+sortLabel+")",
       font:{size:11,color:themeColors().axis}};
+  }
+  // T22: the spectrum range spans the columns that have a latest sample;
+  // nulls are gaps and must not drag the axis floor to 0.
+  var y2Axis=tAxis({title:{text:"latest iteration "+mLabel+" ("+unit+")",font:{size:10,color:themeColors().axis}},showgrid:false,zeroline:false,showline:false,ticks:"",
+      domain:[0.78,1],anchor:"x"});
+  if(latestPresent.length){
+    y2Axis.range=[Math.min.apply(null,latestPresent)*0.95,Math.max.apply(null,latestPresent)*1.02];
   }
   var layout=Object.assign({},baseLayout,{
     shapes:shapes,annotations:annotations,
@@ -3762,9 +3906,7 @@ function renderWaterfall() {
     yaxis:tAxis({title:tAxisTitle("Iteration"),showgrid:false,zeroline:false,showline:false,ticks:"",
       range:[yLabels[0],yLabels[yLabels.length-1]],
       domain:[0,0.72]}),
-    yaxis2:tAxis({title:{text:mLabel+" ("+unit+")",font:{size:10,color:themeColors().axis}},showgrid:false,zeroline:false,showline:false,ticks:"",
-      domain:[0.78,1],anchor:"x",
-      range:[Math.min.apply(null,colLatest)*0.95,Math.max.apply(null,colLatest)*1.02]}),
+    yaxis2:y2Axis,
     height:Math.max(600,Math.min(iterCount*0.5+200,1000)),
     margin:{t:36,b:nCols<=24?80:sortMode==="topology"?52:90,l:72,r:60}
   });
@@ -3807,7 +3949,7 @@ function renderInventory() {
   } else {
     displayData.sort(function(a,b){return a.r.hostname<b.r.hostname?-1:a.r.hostname>b.r.hostname?1:a.r.gpu-b.r.gpu;});
   }
-  var cols=["Hostname","GPU","Model","Serial",axisTitle(metric,unit),"vs Fleet","Power","Temp","Status"];
+  var cols=["Hostname","GPU","Model","Serial","GPU "+metricStatistic(metric)+" "+metricNoun(metric)+" ("+unit+")","vs fleet mean","Power","Temp","Status"];
   var aligns=["left","right","left","left","right","right","right","right","center"];
   var h='<table><thead><tr>';
   cols.forEach(function(c,i){
