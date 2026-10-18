@@ -3,6 +3,8 @@
 """
 Unit tests for argument parsing and configuration.
 """
+import logging
+
 import pytest
 
 
@@ -743,3 +745,249 @@ class TestStressFromConfig:
         args = self._apply(th, parser, config)
         assert args.stress_test is True
         assert args.duration == 30
+
+
+class TestMeltParsing:
+    """Melt mode (TIM settling) flags and YAML keys."""
+
+    def _apply(self, th, parser, config, cli=()):
+        import sys
+        orig = sys.argv
+        sys.argv = ["torch-hammer.py", *cli]
+        try:
+            args = parser.parse_args(list(cli))
+            return th.apply_config_to_args(args, config)
+        finally:
+            sys.argv = orig
+
+    def test_melt_defaults(self, th, default_args):
+        assert default_args.melt is False
+        assert default_args.melt_only is False
+        assert default_args.precision_melt == "float32"
+        assert default_args.melt_burst_ms == th.MELT_BURST_MS == 140
+        assert default_args.melt_cool_ms == th.MELT_COOL_MS == 100
+        assert default_args.melt_max_duration == th.MELT_MAX_DURATION_S == 3600
+        assert default_args.melt_min_duration == th.MELT_MIN_DURATION_S == 3600   # fixed dose: min == max
+        assert default_args.melt_window_s == th.MELT_WINDOW_S == 60
+        assert default_args.melt_bin_s == th.MELT_BIN_S == 10.0
+        assert default_args.melt_plateau_cv_pct == th.MELT_PLATEAU_CV_PCT == 1.0
+        assert default_args.melt_settled_pct == th.MELT_SETTLED_PCT == 98.0
+        assert default_args.melt_target_gflops is None
+        assert default_args.melt_temp_slope_c_per_min == th.MELT_TEMP_SLOPE_C_PER_MIN == 0.5
+        assert default_args.melt_temp_window_s == th.MELT_TEMP_WINDOW_S == 300.0
+        assert default_args.melt_temp_sibling_warn_c == th.MELT_TEMP_SIBLING_WARN_C == 5.0
+
+    def test_melt_sizes_have_their_own_defaults(self, th, default_args):
+        """Melt must heat a die; it does not inherit the characterization --m/--n/--k."""
+        assert default_args.melt_m == default_args.melt_n == default_args.melt_k == th.MELT_MNK == 4096
+        assert default_args.melt_batch_count == th.MELT_BATCH == 8
+
+    def test_melt_pause_ms_is_gone(self, parser):
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--melt", "--melt-pause-ms", "10"])
+
+    def test_melt_help_text_mentions_minutes_and_independence(self, parser):
+        text = " ".join(parser.format_help().split())
+        assert text.count("3600 = 60 min") == 2
+        assert "independent of --m" in text
+
+    def test_melt_and_tim_settle_share_a_destination(self, parser):
+        assert parser.parse_args(["--melt"]).melt is True
+        assert parser.parse_args(["--tim-settle"]).melt is True
+
+    def test_melt_only(self, parser):
+        args = parser.parse_args(["--melt", "--melt-only", "--batched-gemm"])
+        assert args.melt_only is True
+        assert args.batched_gemm is True
+
+    def test_melt_tuning_flags(self, parser):
+        args = parser.parse_args([
+            "--melt", "--precision-melt", "float64",
+            "--melt-m", "4096", "--melt-n", "2048", "--melt-k", "1024",
+            "--melt-batch-count", "8", "--melt-burst-ms", "200",
+            "--melt-cool-ms", "50", "--melt-max-duration", "600",
+            "--melt-min-duration", "120", "--melt-window-s", "30",
+            "--melt-plateau-cv-pct", "2.5", "--melt-settled-pct", "95",
+            "--melt-target-gflops", "47000",
+            "--melt-temp-slope-c-per-min", "0.3", "--melt-temp-window-s", "300",
+            "--melt-temp-sibling-warn-c", "8",
+        ])
+        assert args.precision_melt == "float64"
+        assert (args.melt_m, args.melt_n, args.melt_k, args.melt_batch_count) == (4096, 2048, 1024, 8)
+        assert args.melt_burst_ms == 200
+        assert args.melt_cool_ms == 50
+        assert args.melt_max_duration == 600
+        assert args.melt_min_duration == 120
+        assert args.melt_window_s == 30
+        assert args.melt_plateau_cv_pct == 2.5
+        assert args.melt_settled_pct == 95
+        assert args.melt_target_gflops == 47000
+        assert args.melt_temp_slope_c_per_min == 0.3
+        assert args.melt_temp_window_s == 300.0
+        assert args.melt_temp_sibling_warn_c == 8.0
+
+    def test_precision_melt_rejects_complex(self, parser):
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--precision-melt", "complex64"])
+
+    def test_melt_dims_ignore_characterization_sizes(self, th, parser):
+        args = parser.parse_args(["--m", "256", "--n", "128", "--k", "64", "--batch-count-gemm", "16"])
+        assert th._melt_dims(args) == (8, 4096, 4096, 4096)
+        args = parser.parse_args(["--m", "256", "--melt-m", "32", "--melt-batch-count", "2"])
+        assert th._melt_dims(args) == (2, 32, 4096, 4096)
+
+    def test_yaml_cool_ms_key(self, th):
+        assert th._MELT_CONFIG_KEYS["cool_ms"] == "melt_cool_ms"
+        assert th._MELT_CONFIG_KEYS["bin_s"] == "melt_bin_s"
+        assert "pause_ms" not in th._MELT_CONFIG_KEYS
+
+    def test_yaml_temperature_keys(self, th):
+        assert th._MELT_CONFIG_KEYS["temp_slope_c_per_min"] == "melt_temp_slope_c_per_min"
+        assert th._MELT_CONFIG_KEYS["temp_window_s"] == "melt_temp_window_s"
+        assert th._MELT_CONFIG_KEYS["temp_sibling_warn_c"] == "melt_temp_sibling_warn_c"
+
+    def test_yaml_melt_entry_sets_temperature_knobs(self, th, parser):
+        args = parser.parse_args(["--melt"])
+        th._apply_melt_config(args, {"name": "melt", "temp_slope_c_per_min": 0, "temp_window_s": 300,
+                                     "temp_sibling_warn_c": 6})
+        assert args.melt_temp_slope_c_per_min == 0
+        assert args.melt_temp_window_s == 300
+        assert args.melt_temp_sibling_warn_c == 6
+
+    def test_yaml_melt_entry_lands_in_benchmark_list(self, th, parser):
+        config = {"benchmarks": [
+            {"name": "melt", "precision": "float64", "burst_ms": 200, "window_s": 30,
+             "m": 4096, "batch_count": 4, "max_duration": 1200},
+            {"name": "batched_gemm"},
+        ]}
+        args = self._apply(th, parser, config)
+        names = [b["name"] for b in args.benchmark_list]
+        assert names == ["melt", "batched_gemm"]
+        melt = args.benchmark_list[0]
+        assert melt["precision"] == "float64"
+        assert melt["burst_ms"] == 200
+        assert melt["window_s"] == 30
+
+    def test_yaml_melt_name_is_valid(self, th, parser, capsys):
+        self._apply(th, parser, {"benchmarks": [{"name": "melt"}]})
+        assert "invalid name 'melt'" not in capsys.readouterr().out
+
+    def test_yaml_global_melt_true_sets_flag(self, th, parser):
+        args = self._apply(th, parser, {"global": {"melt": True}})
+        assert args.melt is True
+
+    def test_yaml_global_tim_settle_true_sets_flag(self, th, parser):
+        args = self._apply(th, parser, {"global": {"tim_settle": True}})
+        assert args.melt is True
+
+    def test_yaml_global_melt_only_sets_flag(self, th, parser):
+        args = self._apply(th, parser, {"global": {"melt_only": True}})
+        assert args.melt_only is True
+
+
+class TestMeltArgValidation:
+    """Fail fast on contradictory melt flags (Don Norman H1/M5)."""
+
+    class _ErrorParser:
+        def error(self, message):
+            raise ValueError(message)
+
+    def _validate(self, th, parser, argv, caplog=None):
+        args = parser.parse_args(argv)
+        log = logging.getLogger("test_melt_validate")
+        th._validate_melt_args(self._ErrorParser(), args, log)
+        return args
+
+    def test_min_duration_must_not_exceed_max(self, th, parser):
+        with pytest.raises(ValueError) as exc:
+            self._validate(th, parser, ["--melt", "--melt-min-duration", "5", "--melt-max-duration", "2"])
+        assert "5" in str(exc.value) and "2" in str(exc.value)
+        assert "--melt-min-duration" in str(exc.value) and "--melt-max-duration" in str(exc.value)
+
+    def test_min_duration_equal_to_max_is_a_fixed_dose(self, th, parser):
+        args = self._validate(th, parser, ["--melt", "--melt-min-duration", "2", "--melt-max-duration", "2"])
+        assert args.melt_min_duration == args.melt_max_duration == 2
+        args = self._validate(th, parser, ["--melt"])
+        assert args.melt_min_duration == args.melt_max_duration == 3600
+
+    @pytest.mark.parametrize("flag", ["--melt-window-s", "--melt-burst-ms", "--melt-max-duration"])
+    def test_positive_only_flags(self, th, parser, flag):
+        with pytest.raises(ValueError, match="must be > 0"):
+            self._validate(th, parser, ["--melt", flag, "0"])
+
+    def test_cool_ms_may_be_zero_but_not_negative(self, th, parser):
+        self._validate(th, parser, ["--melt", "--melt-cool-ms", "0"])
+        with pytest.raises(ValueError, match="--melt-cool-ms"):
+            self._validate(th, parser, ["--melt", "--melt-cool-ms", "-1"])
+
+    @pytest.mark.parametrize("value", ["0", "100.5", "-3"])
+    def test_settled_pct_range(self, th, parser, value):
+        with pytest.raises(ValueError, match="--melt-settled-pct"):
+            self._validate(th, parser, ["--melt", "--melt-settled-pct", value])
+
+    def test_bin_s_must_be_positive_and_fit_three_times_in_the_window(self, th, parser):
+        with pytest.raises(ValueError, match="--melt-bin-s"):
+            self._validate(th, parser, ["--melt", "--melt-bin-s", "0"])
+        with pytest.raises(ValueError, match="--melt-bin-s"):
+            self._validate(th, parser, ["--melt", "--melt-bin-s", "25", "--melt-window-s", "60"])
+        self._validate(th, parser, ["--melt", "--melt-bin-s", "20", "--melt-window-s", "60"])
+
+    def test_bin_s_fit_tolerates_floating_point_rounding(self, th, parser):
+        # 0.2 * 3 == 0.6000000000000001 in binary floating point; the user typed exactly three bins.
+        self._validate(th, parser, ["--melt", "--melt-bin-s", "0.2", "--melt-window-s", "0.6"])
+        self._validate(th, parser, ["--melt", "--melt-bin-s", "0.1", "--melt-window-s", "0.3"])
+
+    def test_plateau_cv_pct_must_not_be_negative(self, th, parser):
+        with pytest.raises(ValueError, match="--melt-plateau-cv-pct"):
+            self._validate(th, parser, ["--melt", "--melt-plateau-cv-pct", "-0.1"])
+
+    @pytest.mark.parametrize("flag", ["--melt-temp-slope-c-per-min", "--melt-temp-sibling-warn-c"])
+    def test_temperature_thresholds_may_be_zero_but_not_negative(self, th, parser, flag):
+        self._validate(th, parser, ["--melt", flag, "0"])
+        with pytest.raises(ValueError, match=f"{flag} must be >= 0"):
+            self._validate(th, parser, ["--melt", flag, "-1"])
+
+    def test_temp_window_must_be_positive(self, th, parser):
+        with pytest.raises(ValueError, match="--melt-temp-window-s must be > 0"):
+            self._validate(th, parser, ["--melt", "--melt-temp-window-s", "0"])
+
+    @pytest.mark.parametrize("argv, expected", [
+        (["--melt", "--melt-temp-window-s", "30"], 60.0),                 # explicit horizon shorter than the window
+        (["--melt", "--melt-window-s", "400"], 400.0),                    # default 300 s horizon vs a longer window
+    ])
+    def test_temp_window_shorter_than_the_window_is_raised_to_it(self, th, parser, argv, expected, caplog):
+        with caplog.at_level(logging.INFO, logger="test_melt_validate"):
+            args = self._validate(th, parser, argv)
+        assert args.melt_temp_window_s == expected
+        assert any(r.message == f"--melt-temp-window-s raised to {expected:g} s to cover --melt-window-s"
+                   for r in caplog.records)
+
+    def test_temp_window_at_least_the_window_is_left_alone(self, th, parser, caplog):
+        with caplog.at_level(logging.INFO, logger="test_melt_validate"):
+            args = self._validate(th, parser, ["--melt", "--melt-temp-window-s", "60"])
+        assert args.melt_temp_window_s == 60.0
+        assert not any("raised" in r.message for r in caplog.records)
+
+    def test_window_longer_than_min_duration_only_warns(self, th, parser, caplog):
+        with caplog.at_level(logging.WARNING, logger="test_melt_validate"):
+            self._validate(th, parser, ["--melt", "--melt-window-s", "400", "--melt-min-duration", "300"])
+        assert any("window extends before the min-duration gate" in r.message for r in caplog.records)
+
+    def test_melt_only_implies_melt(self, th, parser, caplog):
+        with caplog.at_level(logging.INFO, logger="test_melt_validate"):
+            args = self._validate(th, parser, ["--melt-only"])
+        assert args.melt is True
+        assert any("--melt-only implies --melt" in r.message for r in caplog.records)
+
+    def test_duration_does_not_apply_to_melt(self, th, parser, caplog):
+        with caplog.at_level(logging.INFO, logger="test_melt_validate"):
+            self._validate(th, parser, ["--melt", "--duration", "60"])
+        assert any("--duration does not apply to melt" in r.message for r in caplog.records)
+
+    def test_valid_defaults_pass_silently(self, th, parser, caplog):
+        with caplog.at_level(logging.INFO, logger="test_melt_validate"):
+            self._validate(th, parser, ["--melt"])
+        assert caplog.records == []
+
+    def test_no_melt_is_a_no_op(self, th, parser):
+        self._validate(th, parser, ["--batched-gemm", "--melt-min-duration", "5", "--melt-max-duration", "2"])

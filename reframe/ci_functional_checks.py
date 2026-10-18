@@ -28,8 +28,8 @@ Usage (CI):
     reframe -C reframe/settings.py -c reframe/ci_functional_checks.py \\
             -r -t ci --performance-report
 
-Test count breakdown (92 tests):
-    ── Individual benchmark × precision (67 tests) ──
+Test count breakdown (93 tests):
+    ── Individual benchmark × precision (68 tests) ──
     GEMM          7  (6 precisions + TF32)
     Conv          6  (6 precisions)
     FFT           6  (6 precisions)
@@ -39,6 +39,7 @@ Test count breakdown (92 tests):
     Schrödinger  12  (6 precisions × 2 potentials)
     Atomic        4  (4 precisions)
     Sparse        2  (2 precisions: float32, float64)
+    Melt          1  (TIM settling, tiny sizes, 5 s cap)
     ── Precision matrix: all benchmarks together (16 tests) ──
     AllStandard   6  (7 benchmarks × 6 precisions, one invocation each)
     AllReal       4  (9 benchmarks × 4 real precisions, one invocation each)
@@ -55,7 +56,7 @@ Test count breakdown (92 tests):
     StressTest    1
     Shuffle       1
     ──────────────
-    Total        92
+    Total        93
 """
 
 import os
@@ -567,6 +568,55 @@ class CI_Sparse(TorchHammerCIBase):
     def perf_mean(self):
         return sn.extractsingle(
             r'\[GPU\d+\s+Sparse MM\]\s+Performance:\s+[\d.]+\s*/\s*'
+            r'([\d.]+)\s*/\s*[\d.]+\s+GFLOP/s',
+            self.stdout, 1, float,
+        )
+
+
+# =====================================================================
+#  Melt mode (TIM settling) – 1 short cycle run  (1 test)
+# =====================================================================
+@rfm.simple_test
+class CI_Melt(TorchHammerCIBase):
+    """Melt mode on the real CUDA path: pinned host→device reload cool gap.
+
+    Tiny matrices and a ~5 s cap: this checks the heat/cool loop, the
+    calibration, the settled/not-settled verdict and the summary line, not
+    whether the GPU actually settles.
+    """
+
+    tags = {'ci', 'gpu', 'melt'}
+    descr = 'CI · Melt (TIM settling)'
+
+    @run_before('run')
+    def set_benchmark_opts(self):
+        self.executable_opts += [
+            '--melt',
+            '--melt-m=64', '--melt-n=64', '--melt-k=64',
+            '--melt-batch-count=2',
+            '--melt-burst-ms=20',
+            '--melt-cool-ms=20',
+            '--melt-min-duration=1',
+            '--melt-window-s=1',
+            '--melt-bin-s=0.25',
+            '--melt-max-duration=5',
+        ]
+
+    @sanity_function
+    def validate_run(self):
+        return sn.all([
+            sn.assert_found(r'\[GPU\d+\s+Melt\]\s+Cool gap: host→device reload', self.stdout),
+            sn.assert_found(r'\[GPU\d+\s+Melt\]\s+Cool gap: h2d_\w+ reload [\d.]+ ms', self.stdout),
+            sn.assert_found(r'\[GPU\d+\s+Melt\]\s+Calibrated burst', self.stdout),
+            sn.assert_found(r'\[GPU\d+\s+Melt\]\s+(SETTLED|NOT SETTLED) after', self.stdout),
+            sn.assert_found(r'\[GPU\d+\s+Melt\]\s+Performance:', self.stdout),
+            _no_traceback(self),
+        ])
+
+    @performance_function('GFLOP/s')
+    def perf_mean(self):
+        return sn.extractsingle(
+            r'\[GPU\d+\s+Melt\]\s+Performance:\s+[\d.]+\s*/\s*'
             r'([\d.]+)\s*/\s*[\d.]+\s+GFLOP/s',
             self.stdout, 1, float,
         )

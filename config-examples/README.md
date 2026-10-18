@@ -26,6 +26,7 @@ Override config settings via CLI:
 | `quick-test.yaml` | Fast sanity check | ~2 minutes |
 | `stress-test.yaml` | Comprehensive test suite | ~15-30 minutes |
 | `platform-stress.yaml` | Full precision sweep across all benchmarks | ~30-45 minutes per GPU |
+| `melt.yaml` | Melt (TIM settling) on all GPUs, then float64 GEMM characterization. For new or repaired GPU modules. | 60 minutes, plus the characterization |
 
 ## Configuration File Format
 
@@ -101,6 +102,11 @@ patterns and inner-loop counts are left as written.
 | `schrodinger` | Quantum simulation | schrodinger_grid_size | All 6 |
 | `atomic_contention` | L2 cache stress | atomic_target_size | float16, bfloat16, float32, float64 |
 | `sparse_mm` | Sparse matrix multiply | sparse_m, sparse_n, sparse_density | float16, bfloat16, float32, float64 |
+| `melt` | TIM settling: GEMM bursts alternating with idle gaps for a fixed duration, then a SETTLED or NOT SETTLED verdict. Always runs first. | m, n, k, batch_count, burst_ms, cool_ms, max_duration, min_duration, window_s, bin_s, plateau_cv_pct, settled_pct, target_gflops, temp_slope_c_per_min, temp_window_s, temp_sibling_warn_c | float16, bfloat16, float32, float64 |
+
+`melt` always runs first, wherever it appears in the list. Under `global:`, `melt: true` adds a melt
+entry with default settings, and `melt_only: true` skips all other benchmarks. Keys are the `--melt-*`
+flag names without the prefix, with hyphens replaced by underscores; `precision` corresponds to `--precision-melt`. See [Melt Mode](../README.md#melt-mode-tim-settling) in the main README.
 
 ## Precision Options
 
@@ -111,4 +117,4 @@ patterns and inner-loop counts are left as written.
 - `complex64` - Complex single
 - `complex128` - Complex double
 
-**Note:** FFT does not support `bfloat16`. Atomic contention and sparse MM do not support complex types.
+**Note:** FFT does not support `bfloat16`. Atomic contention, sparse MM and melt do not support complex types.

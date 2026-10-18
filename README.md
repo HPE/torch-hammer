@@ -39,15 +39,17 @@ When building Torch Hammer, I was inspired by my undergraduate work in quantum c
 3. [Installation](#installation)  
 4. [Quick Start](#quick-start)  
 5. [Command-line Reference](#command-line-reference)  
-6. [Verbose-Mode](#Verbose)  
-7. [Compact Mode](#compact-mode)  
-8. [Syslog Mode](#syslog-mode)  
-9. [Telemetry Back-ends](#telemetry-back-ends)  
-10. [Reporting](#reporting)  
-11. [Examples](#examples)  
-12. [Contributing](#contributing)  
-13. [Project Governance](#project-governance)
-14. [License](#license)  
+6. [Melt Mode (TIM Settling)](#melt-mode-tim-settling)  
+7. [YAML Configuration](#yaml-configuration)  
+8. [Verbose-Mode](#Verbose)  
+9. [Compact Mode](#compact-mode)  
+10. [Syslog Mode](#syslog-mode)  
+11. [Telemetry Back-ends](#telemetry-back-ends)  
+12. [Reporting](#reporting)  
+13. [Examples](#examples)  
+14. [Contributing](#contributing)  
+15. [Project Governance](#project-governance)
+16. [License](#license)  
 
 ---
 
@@ -63,6 +65,7 @@ When building Torch Hammer, I was inspired by my undergraduate work in quantum c
   7. 1-D time-dependent Schrödinger equation
   8. Atomic contention (L2 cache stress via scatter_add)
   9. Sparse matrix multiplication (SpMM)
+- **Melt mode (TIM settling)**: GEMM heat/cool cycling that settles the thermal interface of new or repaired GPU modules and reports SETTLED / NOT SETTLED per GPU. See [Melt Mode](#melt-mode-tim-settling).
 - **Precision choices**: `float16`, `bfloat16`, `float32`, `float64`, `complex64`, `complex128`.
 - **Tensor Core support**: Optional TF32 mode on newer platforms.
 - **Live telemetry**
@@ -297,8 +300,9 @@ Each benchmark has its own `--precision-<test>` flag. The available data types v
 | Schrödinger | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | float32 |
 | **Atomic Contention** | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | float32 |
 | **Sparse MM** | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | float32 |
+| Melt (TIM settling) | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | float32 |
 
-> **Note:** FFT does not support `bfloat16` (`torch.fft.fftn` limitation). Atomic Contention and Sparse MM only support `float32` and `float64`. Using TF32 mode (`--batched-gemm-TF32-mode`) forces `float32` regardless of `--precision-gemm`.
+> **Note:** FFT does not support `bfloat16` (`torch.fft.fftn` limitation). Atomic Contention and Sparse MM only support `float32` and `float64`. Melt supports the four real types only. Using TF32 mode (`--batched-gemm-TF32-mode`) forces `float32` regardless of `--precision-gemm`.
 
 ### Batched GEMM
 | Option | Description |
@@ -393,6 +397,110 @@ Each benchmark has its own `--precision-<test>` flag. The available data types v
 | `--inner-loop-sparse <int>` | Timed iterations (default: 50). |
 | `--precision-sparse <dtype>` | Data type (default: _float32_). **No complex types** — choices: `float16`, `bfloat16`, `float32`, `float64`. |
 
+### Melt (TIM Settling)
+Melt is a conditioning step, not a benchmark. It runs before any selected benchmark. See [Melt Mode](#melt-mode-tim-settling).
+
+| Option | Description |
+|--------|-------------|
+| `--melt`, `--tim-settle` | Run melt before the selected benchmarks. |
+| `--melt-only` | Run melt and skip all other benchmarks (implies `--melt`). |
+| `--precision-melt <dtype>` | Data type: `float16`, `bfloat16`, `float32` or `float64` (default: _float32_). |
+| `--melt-m / --melt-n / --melt-k <int>` | Matrix dimensions (default: _4096_). |
+| `--melt-batch-count <int>` | Number of matrices per batch (default: _8_). |
+| `--melt-burst-ms <float>` | Target duration of each GEMM burst, in ms (default: _140_). |
+| `--melt-cool-ms <float>` | Minimum duration of each cool gap, in ms (default: _100_). |
+| `--melt-max-duration <float>` | Total melt duration, in s (default: _3600_). |
+| `--melt-min-duration <float>` | Earliest time at which a GPU can be declared SETTLED, in s (default: _3600_). Set to 300 to re-check a module that has already been melted. |
+| `--melt-window-s <float>` | Length of the evaluation window at the end of the run, in s (default: _60_). |
+| `--melt-bin-s <float>` | Averaging interval within the window, in s (default: _10_). |
+| `--melt-plateau-cv-pct <float>` | Maximum coefficient of variation of the interval-mean GFLOP/s, in % (default: _1.0_). |
+| `--melt-settled-pct <float>` | Minimum window mean, as a percentage of the best window mean so far. Applies only when the minimum duration is shorter than the maximum (default: _98_). |
+| `--melt-target-gflops <float>` | Minimum window mean, in GFLOP/s (default: _off_). |
+| `--melt-temp-slope-c-per-min <float>` | Maximum rate of temperature change, in °C/min; 0 disables the rule (default: _0.5_). |
+| `--melt-temp-window-s <float>` | Window over which the rate of temperature change is measured, in s (default: _300_). |
+| `--melt-temp-sibling-warn-c <float>` | Multi-GPU runs: temperature excess over sibling GPUs at equal power that triggers a warning, in °C; 0 disables the warning (default: _5_). |
+
+---
+
+## Melt Mode (TIM Settling)
+
+Some GPU modules use a thermal interface material (TIM) that must settle before the GPU can reach full performance. Until the TIM settles, heat transfer from the die to the cold plate is impaired: the GPU runs hot, throttles, and benchmarks understate its performance. The TIM settles under repeated heating and cooling, not under sustained load.
+
+`--melt` (alias `--tim-settle`) alternates each GPU between short GEMM bursts and idle gaps for a fixed duration, 60 minutes by default, then reports whether the GPU is SETTLED or NOT SETTLED. Run it once on each new or repaired module, before any characterization. With `--all-gpus`, all GPUs are melted in parallel.
+
+### How it works
+
+Each cycle consists of a GEMM burst of about 140 ms followed by a cool gap of at least 100 ms. During the gap, one input matrix is reloaded from pinned host memory and the GPU's compute units are idle. On GH200 this gives a duty cycle of about 58 %.
+
+When the run ends, the tool averages GFLOP/s and temperature over 10-second intervals and applies these rules:
+
+| Rule | Measured over | Default limit |
+|------|---------------|---------------|
+| Hardware or software thermal throttling | last 60 s | none |
+| Coefficient of variation of the interval-mean GFLOP/s | last 60 s | 1 % |
+| Rate of change of the interval-mean temperature, rising or falling | last 300 s | 0.5 °C/min |
+| Mean GFLOP/s (optional) | last 60 s | `--melt-target-gflops` |
+
+A GPU is SETTLED only if it passes every rule. Averaging over 10-second intervals reduces the fluctuation caused by clock-frequency changes (DVFS) and by the alternation of bursts and gaps. Power-cap throttling and absolute temperature are not evaluated. If temperature telemetry is unavailable, the temperature rule is skipped.
+
+If `--melt-min-duration` is shorter than `--melt-max-duration`, the rules are evaluated after every cycle from that time onward, and the run stops as soon as they pass. One further rule then applies: the window mean must reach 98 % of the highest throttle-free window mean recorded so far. Use this to re-check a module that has already been melted.
+
+Melt always runs before the other selected benchmarks. Telemetry statistics are reset before each benchmark, so throttling during melt is not attributed to later benchmarks. `--duration` does not apply to melt. Contradictory settings, such as a minimum duration longer than the maximum, are rejected at startup.
+
+### Examples
+
+```bash
+# Melt all GPUs at float64
+./torch-hammer.py --melt --all-gpus --precision-melt float64 --json-output melt.json
+
+# Melt, then characterize
+./torch-hammer.py --melt --batched-gemm --all-gpus --precision-melt float64 \
+  --precision-gemm float64 --json-output gh200.json --summary-csv gh200.csv
+
+# The same, from a configuration file
+./torch-hammer.py --config config-examples/melt.yaml
+```
+
+### Results
+
+```
+[GPU0 Melt] Calibrated burst ≈ 138.5 ms = 5 matmuls (27.70 ms each, target 140 ms)
+[GPU0 Melt] Cool gap: h2d_pinned reload 3.1 ms + sleep to 100 ms floor (duty cycle 58% hot)
+[GPU0 Melt] 48.1/60.0 min | 12,020 cycles | window 52,900 GFLOP/s, CV 0.3% (cycle 2.4%) | best n/a | power 180–655 W | temp 62.0 °C (−0.1 °C/min) | not settled: min duration 3600 s not reached
+[GPU0 Melt] SETTLED after 60.0 min (cycles 15,000): 24,310 → 54,080 GFLOP/s, power 180–655 W, temp 61 °C
+  start → end: temp 67.7 → 58.9 °C (−8.8 at 423 W) | 24,310 → 54,080 GFLOP/s (+122.5%) | thermal throttle 18 → 0 cycles
+```
+
+A progress line is logged every 60 s. The `start → end` line compares the first and last 60 s of the run.
+
+If a GPU is NOT SETTLED:
+- the verdict is logged as a warning, followed by the rule that failed;
+- the final line of the run reads `[FAIL]` instead of `[OK]`;
+- the GPU's row in the summary table reads `FAIL`.
+
+Rerun melt once. A second NOT SETTLED result indicates a fault in the module's thermal path: the TIM, the cold-plate contact or the coolant flow. The exception is a GPU that never throttled and failed only the GFLOP/s variation rule; the tool reports that as measurement noise, not as a module fault.
+
+The verdict does not change the exit code. Scripts should read the `settled` field in the JSON output.
+
+In multi-GPU runs, the tool compares each GPU's mean temperature over the final 60 s with the median of its siblings that drew the same mean power, within 5 %. A GPU more than 5 °C hotter than that median receives a warning and a note in its summary row. Its status is not changed.
+```
+[GPU1 Melt] ends the dose 8.1 °C hotter than siblings at equal power (52.0 vs 43.9 °C @ 411 W) — check thermal path (TIM coverage, mount pressure, coolant flow position)
+```
+
+**Outputs**
+- **JSON**: for each GPU, `settled`, `settle_s`, `start_gflops`, `plateau_gflops`, `stop_rules_failed`, temperature and throttle counts for the first and last windows, and per-cycle telemetry.
+- **Syslog**: the `BENCH_RESULT` entry includes `settled=` and `settle_s=`.
+- **Summary table and summary CSV**: Performance is the mean GFLOP/s over the final 60 s.
+- **Compact CSV**: the columns are unchanged.
+
+### Portability
+
+- **CUDA and ROCm**: the cool gap is a pinned host-to-device reload. Melt needs host memory equal to the size of the input matrices: 1 GiB at the defaults, 2 GiB at float64. ROCm has not yet been validated on hardware.
+- **MPS and CPU**: there is no host-to-device reload, so there is no cool gap, and there is no temperature telemetry. Use these only for smoke tests.
+- **Precision**: the default, `float32`, runs on the widest range of hardware. Use `float64` on data-center GPUs.
+
+**Reference**: Wazirzada and Warner, "20,000 GPUs Under the DGEMM Sea: Insights from NVIDIA GPU Performance Characterization", Cray User Group (CUG) 2026. Section 5 covers TIM settling.
+
 ---
 
 ## YAML Configuration
@@ -463,7 +571,11 @@ CLI arguments override YAML settings:
 ./torch-hammer.py --config config.yaml --verbose-file-only
 ```
 
-See `config-examples/` directory for ready-to-use configurations (`quick-test.yaml`, `stress-test.yaml`, `platform-stress.yaml`).
+See `config-examples/` directory for ready-to-use configurations (`quick-test.yaml`, `stress-test.yaml`, `platform-stress.yaml`, `melt.yaml`).
+
+### Melt in YAML
+
+`name: melt` is a valid benchmark entry and always runs first, wherever it appears in the list. Keys are the CLI flag names without the `--melt-` prefix, with hyphens replaced by underscores (for example `burst_ms`, `max_duration`, `temp_window_s`); `precision` corresponds to `--precision-melt`. Under `global:`, `melt: true` adds a melt entry with default settings, and `melt_only: true` skips all other benchmarks. See `config-examples/melt.yaml`.
 
 ---
 

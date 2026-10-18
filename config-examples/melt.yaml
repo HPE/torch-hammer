@@ -1,0 +1,56 @@
+# Torch Hammer configuration: melt (TIM settling), then characterization
+# Usage: ./torch-hammer.py --config config-examples/melt.yaml
+#
+# For new or repaired GPU modules whose thermal interface material (TIM) must
+# settle before the GPU reaches full performance. Melt alternates each GPU
+# between GEMM bursts and idle gaps for 60 minutes and reports SETTLED or
+# NOT SETTLED. The batched_gemm entry then measures float64 performance.
+# Melt always runs first, wherever it appears in the list.
+#
+# The melt matrix sizes are independent of the characterization sizes below.
+# If you change them, check the "Calibrated burst" log line: a burst should
+# contain more than one matmul, with no "too small to heat the die" warning.
+
+profile: "Melt then Characterize (float64)"
+description: "TIM settling on all GPUs, followed by a float64 batched GEMM characterization"
+
+global:
+  all_gpus: true
+  warmup: 10
+  # log_dir: ./melt-logs       # One log file per GPU
+  # verbose: true              # One CSV row per melt cycle (about 15,000 rows per GPU)
+  # For per-cycle telemetry, pass --json-output melt.json on the command line.
+
+benchmarks:
+  # Step 1: melt. A NOT SETTLED verdict fails the GPU's summary row but does
+  # not change the exit code.
+  - name: melt
+    enabled: true
+    precision: float64         # Use float64 on data-center GPUs
+    batch_count: 8             # batch_count, m, n and k are the defaults, listed for editing
+    m: 4096
+    n: 4096
+    k: 4096
+    burst_ms: 140              # Target duration of each GEMM burst, ms
+    cool_ms: 100               # Minimum duration of each cool gap, ms
+    max_duration: 3600         # Total melt duration, s
+    min_duration: 3600         # Earliest SETTLED verdict, s; set to 300 to re-check a melted module
+    window_s: 60               # Evaluation window at the end of the run, s
+    bin_s: 10                  # Averaging interval within the window, s
+    plateau_cv_pct: 1.0        # Maximum coefficient of variation of the interval-mean GFLOP/s, %
+    settled_pct: 98            # Minimum % of the best window mean; applies only if min_duration < max_duration
+    # target_gflops: 47000     # Minimum window mean, GFLOP/s
+    temp_slope_c_per_min: 0.5  # Maximum rate of temperature change, °C/min; 0 disables
+    temp_window_s: 300         # Window for the rate of temperature change, s
+    temp_sibling_warn_c: 5     # Multi-GPU: warn if a GPU is this many °C hotter than equal-power siblings
+
+  # Step 2: characterization. Telemetry statistics are reset before each
+  # benchmark, so throttling during melt is not attributed to this entry.
+  - name: batched_gemm
+    enabled: true
+    precision: float64
+    batch_count: 106
+    m: 4224
+    n: 2048
+    k: 16384
+    inner_loop: 10

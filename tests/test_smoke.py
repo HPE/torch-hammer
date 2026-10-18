@@ -835,3 +835,143 @@ class TestResultStructure:
         
         assert "unit" in result
         assert result["unit"] == "GFLOP/s"
+
+
+class TestMeltExecution:
+    """CPU smoke tests for melt mode (TIM settling) — tiny matrices, short caps."""
+
+    @pytest.fixture
+    def cpu_device(self):
+        return torch.device("cpu")
+
+    @pytest.fixture
+    def mock_telemetry(self, th):
+        return th.CpuTelemetry(0)
+
+    @pytest.fixture
+    def mock_telemetry_thread(self, th, mock_telemetry, cpu_device):
+        thread = th.TelemetryThread(mock_telemetry, cpu_device, sample_interval_ms=50)
+        thread.latest_reading = mock_telemetry.read()
+        return thread
+
+    @pytest.fixture
+    def mock_logger(self):
+        logger = logging.getLogger("test_melt_smoke")
+        logger.setLevel(logging.WARNING)
+        return logger
+
+    @pytest.fixture
+    def mock_printer(self, th, mock_logger):
+        return th.VerbosePrinter(mock_logger, ["vendor", "model", "device_id"], 0)
+
+    @pytest.fixture
+    def melt_args(self, parser):
+        args = parser.parse_args([
+            "--melt", "--warmup", "1", "--skip-telemetry-first-n", "0",
+            "--melt-batch-count", "2", "--melt-m", "32", "--melt-n", "32", "--melt-k", "32",
+            "--melt-burst-ms", "5", "--melt-cool-ms", "5", "--melt-min-duration", "0.2", "--melt-window-s", "0.2",
+            "--melt-bin-s", "0.05",
+            "--melt-max-duration", "2", "--melt-plateau-cv-pct", "100", "--melt-settled-pct", "0",
+        ])
+        args._hardware_baselines = None
+        return args
+
+    def _run(self, th, args, cpu_device, mock_telemetry, mock_telemetry_thread, mock_logger, mock_printer):
+        mock_telemetry.reset_stats()
+        return th.melt_test(args, cpu_device, mock_logger, mock_telemetry, mock_telemetry_thread, mock_printer)
+
+    def test_melt_releases_cool_gap_when_done(self, th, melt_args, cpu_device, mock_telemetry,
+                                              mock_telemetry_thread, mock_logger, mock_printer, monkeypatch):
+        released = []
+        real_factory = th._make_melt_cool_gap
+
+        def spying_factory(*a, **kw):
+            gap = real_factory(*a, **kw)
+            real_release = gap.release
+            gap.release = lambda: (released.append(True), real_release())
+            return gap
+
+        monkeypatch.setattr(th, "_make_melt_cool_gap", spying_factory)
+        result = self._run(th, melt_args, cpu_device, mock_telemetry, mock_telemetry_thread,
+                           mock_logger, mock_printer)
+        assert result is not None
+        assert released == [True]
+
+    def test_melt_runs_and_settles_on_cpu(self, th, melt_args, cpu_device, mock_telemetry,
+                                          mock_telemetry_thread, mock_logger, mock_printer):
+        result = self._run(th, melt_args, cpu_device, mock_telemetry, mock_telemetry_thread,
+                           mock_logger, mock_printer)
+        assert result is not None
+        assert result["name"] == "Melt"
+        assert result["unit"] == "GFLOP/s"
+        assert result["reload_path"] == "uniform_"
+        assert result["cycles"] > 0
+        assert result["iterations"] == result["cycles"]
+        assert result["ops_per_burst"] >= 1
+        assert result["burst_ms_measured"] > 0
+        assert result["settled"] is True
+        assert 0 < result["settle_s"] <= 2.5
+        assert result["start_gflops"] > 0
+        assert result["plateau_gflops"] > 0
+        assert result["thermal_throttle_cycles"] == 0
+        assert result["last_throttle_s"] is None
+        assert result["params"]["dtype"] == "float32"
+        assert (result["params"]["batch"], result["params"]["m"]) == (2, 32)
+        assert result["params"]["burst_ms"] == 5
+
+    def test_melt_not_settled_when_capped_before_min_duration(self, th, melt_args, cpu_device, mock_telemetry,
+                                                              mock_telemetry_thread, mock_logger, mock_printer):
+        melt_args.melt_max_duration = 0.3
+        melt_args.melt_min_duration = 100
+        result = self._run(th, melt_args, cpu_device, mock_telemetry, mock_telemetry_thread,
+                           mock_logger, mock_printer)
+        assert result is not None
+        assert result["settled"] is False
+        assert result["settle_s"] is None
+        assert result["cycles"] > 0
+        assert result["runtime_s"] >= 0.3
+
+    def test_melt_trajectory_in_iteration_telemetry(self, th, melt_args, cpu_device, mock_telemetry,
+                                                    mock_telemetry_thread, mock_logger, mock_printer):
+        # The idle poll interval is 500 ms: run long enough for the thread to
+        # wake up and take samples inside burst windows.
+        melt_args.melt_min_duration = 1.0
+        melt_args.melt_window_s = 0.5
+        melt_args.melt_max_duration = 3.0
+        mock_telemetry_thread.start()
+        try:
+            result = self._run(th, melt_args, cpu_device, mock_telemetry, mock_telemetry_thread,
+                               mock_logger, mock_printer)
+        finally:
+            mock_telemetry_thread.stop()
+        trajectory = result["iteration_telemetry"]
+        assert trajectory, "expected per-cycle records when the telemetry thread is sampling"
+        for entry in trajectory:
+            assert entry["thermal_throttled"] is False
+            assert "power_min_W" in entry and "power_max_W" in entry
+        # melt leaves no per-iteration samples behind for the next benchmark
+        assert mock_telemetry_thread.iteration_samples == {}
+
+    def test_melt_ignores_characterization_dims(self, th, parser, cpu_device, mock_telemetry,
+                                                mock_telemetry_thread, mock_logger, mock_printer):
+        args = parser.parse_args([
+            "--melt", "--warmup", "1", "--m", "999", "--n", "999", "--k", "999", "--batch-count-gemm", "99",
+            "--melt-m", "16", "--melt-n", "16", "--melt-k", "16", "--melt-batch-count", "2",
+            "--melt-burst-ms", "2", "--melt-cool-ms", "1", "--melt-min-duration", "0", "--melt-window-s", "0.2",
+            "--melt-max-duration", "0.5", "--melt-plateau-cv-pct", "100", "--melt-settled-pct", "0",
+        ])
+        args._hardware_baselines = None
+        result = self._run(th, args, cpu_device, mock_telemetry, mock_telemetry_thread,
+                           mock_logger, mock_printer)
+        assert (result["params"]["batch"], result["params"]["m"], result["params"]["n"], result["params"]["k"]) == (2, 16, 16, 16)
+        assert result["params"]["cool_ms"] == 1
+
+    def test_melt_result_reports_cool_gap_measurements(self, th, melt_args, cpu_device, mock_telemetry,
+                                                        mock_telemetry_thread, mock_logger, mock_printer):
+        result = self._run(th, melt_args, cpu_device, mock_telemetry, mock_telemetry_thread,
+                           mock_logger, mock_printer)
+        assert result["reload_ms_measured"] >= 0
+        assert result["params"]["bin_s"] == melt_args.melt_bin_s
+        assert result["plateau_cv_pct"] is not None and result["cycle_cv_pct"] is not None
+        assert 0 < result["duty_cycle_pct"] < 100
+        assert result["duty_cycle_pct"] <= 5 / (5 + 5) * 100 + 15   # 5 ms burst / 5 ms floor, loose bound

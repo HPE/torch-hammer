@@ -665,3 +665,29 @@ class TestSummaryCsv:
         assert written is None
         log.warning.assert_called_once()
         assert "Failed to export CSV summary" in log.warning.call_args[0][0]
+
+
+# ──────────────────────────────────────────────────────────────
+# 13. Melt (TIM settling) rows keep the pinned column set
+# ──────────────────────────────────────────────────────────────
+class TestCompactMeltRow:
+    """A Melt perf dict carries extra keys (settled, settle_s, ...) that must
+    not leak into the compact CSV: its column set is pinned above."""
+
+    def _melt_perf(self):
+        return {
+            "name": "Melt", "unit": "GFLOP/s",
+            "min": 23900.0, "mean": 48000.0, "max": 54120.0,
+            "iterations": 33612, "runtime_s": 4704.0,
+            "params": {"dtype": "float32", "m": 8192},
+            "telemetry": {"power_W_mean": 600.0, "temp_gpu_C_max": 80.0},
+            "settled": True, "settle_s": 4704.0, "cycles": 33612,
+            "reload_path": "h2d_pinned",
+        }
+
+    @pytest.mark.parametrize("verbose", [False, True])
+    def test_melt_row_keys_match_columns(self, th, verbose):
+        row = th._compact_row(self._melt_perf(), {"model": "GH200"}, 0, "node01", verbose)
+        assert list(row.keys()) == th._compact_csv_columns(verbose)
+        assert row["benchmark"] == "Melt"
+        assert row["mean"] == "48000.0000"
