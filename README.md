@@ -428,6 +428,8 @@ Some GPU modules use a thermal interface material (TIM) that must settle before 
 
 `--melt` (alias `--tim-settle`) alternates each GPU between short GEMM bursts and idle gaps for a fixed duration, 60 minutes by default, then reports whether the GPU is SETTLED or NOT SETTLED. Run it once on each new or repaired module, before any characterization. With `--all-gpus`, all GPUs are melted in parallel.
 
+![One hour of melt mode on a GH200 node: three throttling GPUs climb to full speed within 12 minutes, their chips keep cooling until about minute 40, and all three end SETTLED; GPU1, the control, never throttled](docs/images/melt_mode.gif)
+
 ### How it works
 
 Each cycle consists of a GEMM burst of about 140 ms followed by a cool gap of at least 100 ms. During the gap, one input matrix is reloaded from pinned host memory and the GPU's compute units are idle. On GH200 this gives a duty cycle of about 58 %.

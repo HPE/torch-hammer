@@ -2527,6 +2527,72 @@ class TestInteractiveMode:
             hr._iteration_data.clear()
             hr._iteration_data.update(old_data)
 
+class TestIterationTraceIdentity:
+    """Iteration Trace (#53): colour identifies the GPU, so GPUs that share a status stay distinguishable."""
+
+    @staticmethod
+    def _html():
+        from unittest.mock import MagicMock
+        results = _make_results(n_nodes=1, n_gpus=4)
+        stats = hr.compute_benchmark_stats(results)
+        old_data = dict(hr._iteration_data)
+        try:
+            hr._iteration_data.clear()
+            with patch.object(hr, '_PLOTLY_AVAILABLE', True):
+                mock_plotly = MagicMock()
+                mock_plotly.get_plotlyjs.return_value = '/* mock */'
+                with patch.object(hr, '_plotly_offline', mock_plotly):
+                    return hr._render_interactive_html(
+                        results, stats, [], source_name="t.csv", threshold=15.0)
+        finally:
+            hr._iteration_data.clear()
+            hr._iteration_data.update(old_data)
+
+    @classmethod
+    def _render_time_series(cls):
+        html_out = cls._html()
+        start = html_out.index("function renderTimeSeries()")
+        return html_out[start:html_out.index("// ---- Chart 6", start)]
+
+    def test_trace_palette_is_the_static_report_palette(self):
+        html_out = self._html()
+        line = next(l for l in html_out.splitlines() if l.startswith("var TRACE_COLORS = "))
+        assert json.loads(line[len("var TRACE_COLORS = "):].rstrip(";")) == hr.OKABE_ITO
+
+    def test_individual_lines_are_coloured_by_gpu_not_by_status(self):
+        body = self._render_time_series()
+        assert "statusColor(" not in body
+        assert body.count("traceStyle(") == 2   # small-fleet lines and flagged lines over the envelope
+
+    def test_flagged_lines_avoid_the_envelope_blue(self):
+        assert 'traceStyle(ai,["#0072B2"])' in self._render_time_series()
+
+    def test_status_is_kept_in_the_label(self):
+        body = self._render_time_series()
+        assert body.count("statusTag(s.status)") == 2
+        assert "width:tag?2.2:1.2" in body
+
+    def test_series_have_a_stable_host_then_gpu_order(self):
+        assert "allSeries.sort(byHostGpu)" in self._render_time_series()
+
+    def test_single_host_labels_drop_the_hostname(self):
+        assert 'return (oneHost?"":esc(s.host)+":")+"GPU"+s.gpu;' in self._render_time_series()
+
+    def test_hover_highlights_one_gpu(self):
+        html_out = self._html()
+        body = self._render_time_series()
+        assert body.count('meta:"gpu"') == 2
+        assert 'hovermode:"closest"' in body
+        assert 'wireTraceHighlight(document.getElementById("timeseries-chart"));' in body
+        assert 'gd.on("plotly_hover"' in html_out and 'gd.on("plotly_unhover"' in html_out
+
+    def test_black_is_swapped_for_the_theme_ink(self):
+        assert 'if(c==="#000000") c=themeColors().font;' in self._html()
+
+    def test_subtitle_explains_the_interaction(self):
+        assert "Each colour is one GPU; hover a line to highlight it" in self._html()
+
+
 class TestThermalThrottling:
     """Tests for throttle detection, flagging, and display."""
 
