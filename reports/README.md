@@ -207,8 +207,11 @@ Outlier and throttled GPUs get distinct sizing. Power limit detection.
 every metric; colour carries good/bad (outlier and throttle coding). Adaptive
 truncation for >60 nodes keeps both ends plus abnormal nodes.
 
-**Iteration Trace**: p10--p90 envelope for large fleets, individual lines for
-outlier/throttled GPUs, rolling mean smoothing, adaptive downsampling.
+**Iteration Trace**: one line per GPU for up to 15 GPUs; for larger fleets, a
+p10--p90 envelope plus individual lines for outlier/throttled GPUs. Each line's
+colour identifies its GPU (the static report's Okabe-Ito palette); status is
+shown by a thicker line and a tag in the legend and tooltip. Hovering a line
+fades the others. Rolling mean smoothing, adaptive downsampling.
 Per-iteration data from JSON or verbose logs.
 
 **Fleet Waterfall**: Heatmap with spectrum trace. Multiple sort modes

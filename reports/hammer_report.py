@@ -2743,7 +2743,7 @@ def _render_interactive_html(results, bench_stats, outliers, source_name, thresh
     parts.append('  <div class="chart-section" id="timeseries-section" '
                  'style="display:{}">\n'.format(time_series_display))
     parts.append('    <h2>Iteration Trace</h2>\n')
-    parts.append('    <div class="chart-subtitle">Shows stability over time. Flat envelope = steady state. Widening envelope = fleet diverging. Downward drift = thermal throttling or degradation.</div>\n')
+    parts.append('    <div class="chart-subtitle">Shows stability over time. Flat envelope = steady state. Widening envelope = fleet diverging. Downward drift = thermal throttling or degradation. Each colour is one GPU; hover a line to highlight it, click a legend entry to hide it, double-click to show it alone.</div>\n')
     parts.append('    <div id="timeseries-chart" class="chart-div"></div>\n')
     parts.append('  </div>\n')
 
@@ -2804,6 +2804,7 @@ def _render_interactive_html(results, bench_stats, outliers, source_name, thresh
     parts.append('var NODE_MAP = {};\n'.format(node_map_json))
     parts.append('var THRESHOLD = {};\n'.format(threshold))
     parts.append('var THEME_MODE = {};\n'.format(_safe_json(theme_mode)))
+    parts.append('var TRACE_COLORS = {};\n'.format(_safe_json(OKABE_ITO)))
     parts.append('</script>\n')
     # Iteration data in its own block (can be very large).
     # Compress with gzip+base64 to reduce file size (typically 6-8x smaller)
@@ -2936,6 +2937,39 @@ function gpuStatus(r,oSet,tSet) {
 }
 function statusColor(st) {
   return st==="outlier-low"?"#f09595":st==="outlier-high"?"#a78bfa":st==="throttled"?"#fbbf24":"#0072B2";
+}
+// Iteration Trace: colour identifies the GPU, so lines with the same status stay
+// distinguishable. Okabe-Ito order matches the static report's per-GPU colours.
+// `avoid` drops colours already used by other traces (e.g. the fleet envelope);
+// after the palette is exhausted, lines repeat it dotted.
+function traceStyle(i, avoid) {
+  var pal=TRACE_COLORS.filter(function(c){return !avoid||avoid.indexOf(c)<0;});
+  var c=pal[i%pal.length];
+  if(c==="#000000") c=themeColors().font;  // black would vanish on the dark theme
+  return {color:c, dash:Math.floor(i/pal.length)%2?"dot":"solid"};
+}
+function statusTag(st) {
+  return st==="outlier-low"?"outlier \\u2193":st==="outlier-high"?"outlier \\u2191":st==="throttled"?"throttled":"";
+}
+function byHostGpu(a,b) {
+  return a.host<b.host?-1:a.host>b.host?1:(parseInt(a.gpu,10)-parseInt(b.gpu,10));
+}
+// Hovering a GPU line fades the other GPU lines, so a dip can be traced to its GPU.
+function wireTraceHighlight(gd) {
+  var current=null;
+  function gpuTraces(){var idx=[];gd.data.forEach(function(t,i){if(t.meta==="gpu")idx.push(i);});return idx;}
+  gd.on("plotly_hover",function(ev){
+    var c=ev.points[0].curveNumber;
+    if(c===current||!gd.data[c]||gd.data[c].meta!=="gpu") return;
+    current=c;
+    var idx=gpuTraces();
+    Plotly.restyle(gd,{opacity:idx.map(function(i){return i===c?1:0.15;})},idx);
+  });
+  gd.on("plotly_unhover",function(){
+    if(current===null) return;
+    current=null;
+    Plotly.restyle(gd,{opacity:1},gpuTraces());
+  });
 }
 function axisTitle(m, unit) {
   var lbl=metricLabel(m);
@@ -3505,6 +3539,9 @@ function renderTimeSeries() {
     allSeries.push({host:h,gpu:g,label:lbl,rows:rows,mKey:mKey,status:status});
   });
   if (!allSeries.length) { sec.style.display="none"; return; }
+  allSeries.sort(byHostGpu);
+  var oneHost=allSeries.every(function(s){return s.host===allSeries[0].host;});
+  function gpuName(s){return (oneHost?"":esc(s.host)+":")+"GPU"+s.gpu;}
   var traces=[];
   if (allSeries.length > 15) {
     var iterBuckets={};
@@ -3553,7 +3590,7 @@ function renderTimeSeries() {
     });
     var fleetMean=fleetN>0?fleetSum/fleetN:0;
     if (abnormal.length <= 20) {
-      abnormal.forEach(function(s){
+      abnormal.forEach(function(s,ai){
         var sx=s.rows.map(function(r){return r.iteration;});
         var sy=s.rows.map(function(r){return r[mKey];});
         if(sx.length>DS_MAX){var sd=dsIters(sx,[sy],["median"]);sx=sd.x;sy=sd.ya[0];}
@@ -3564,13 +3601,14 @@ function renderTimeSeries() {
         var gMean=gN>0?gSum/gN:0;
         var devPct=fleetMean>0?((gMean-fleetMean)/fleetMean*100).toFixed(1):"?";
         var devStr=(parseFloat(devPct)>0?"+":"")+devPct+"%";
-        var statusTag=s.status==="outlier-low"?"outlier \u2193":s.status==="outlier-high"?"outlier \u2191":"throttled";
+        var st=traceStyle(ai,["#0072B2"]);  // blue is the fleet envelope here
+        var name=gpuName(s)+" ("+statusTag(s.status)+", "+devStr+")";
         traces.push({
-          x:sx,y:sy,
+          x:sx,y:sy,meta:"gpu",
           type:"scatter",mode:"lines",
-          line:{color:statusColor(s.status),width:1.5,dash:s.status==="throttled"?"dash":"solid"},
-          name:esc(s.host)+":GPU"+s.gpu+" ("+statusTag+", "+devStr+")",
-          hovertemplate:esc(s.host)+" GPU"+s.gpu+"<br>"+metricLabel(metric)+": %{y:.1f} "+unit+"<extra></extra>"
+          line:{color:st.color,width:1.5,dash:st.dash},
+          name:name,
+          hovertemplate:name+"<br>"+metricLabel(metric)+": %{y:.1f} "+unit+"<extra></extra>"
         });
       });
     } else {
@@ -3615,16 +3653,18 @@ function renderTimeSeries() {
       });
     }
   } else {
-    allSeries.forEach(function(s){
+    allSeries.forEach(function(s,i){
       var sx=s.rows.map(function(r){return r.iteration;});
       var sy=s.rows.map(function(r){return r[mKey];});
       if(sx.length>DS_MAX){var sd=dsIters(sx,[sy],["median"]);sx=sd.x;sy=sd.ya[0];}
+      var st=traceStyle(i), tag=statusTag(s.status);
+      var name=gpuName(s)+(tag?" ("+tag+")":"");
       traces.push({
-        x:sx,y:sy,
+        x:sx,y:sy,meta:"gpu",
         type:"scatter",mode:"lines",
-        line:{color:statusColor(s.status),width:s.status!=="normal"?2:1.2},
-        name:esc(s.host)+":GPU"+s.gpu,
-        hovertemplate:esc(s.host)+" GPU"+s.gpu+"<br>"+metricLabel(metric)+": %{y:.1f} "+unit+"<extra></extra>"
+        line:{color:st.color,dash:st.dash,width:tag?2.2:1.2},
+        name:name,
+        hovertemplate:name+"<br>"+metricLabel(metric)+": %{y:.1f} "+unit+"<extra></extra>"
       });
     });
   }
@@ -3632,9 +3672,10 @@ function renderTimeSeries() {
     showlegend:true,legend:{bgcolor:"rgba(0,0,0,0)",font:{color:themeColors().axis,size:11},orientation:"h",x:0,y:1.12},
     xaxis:tAxis({title:tAxisTitle("Iteration")}),
     yaxis:tAxis({title:tAxisTitle(axisTitle(metric,unit))}),
-    height:400,margin:{t:52,b:56,l:72,r:24}
+    height:400,margin:{t:52,b:56,l:72,r:24},hovermode:"closest"
   });
   Plotly.newPlot("timeseries-chart",traces,layout,plotConfig);
+  wireTraceHighlight(document.getElementById("timeseries-chart"));
 }
 
 // ---- Chart 6: Fleet Waterfall ----
