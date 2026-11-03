@@ -4,6 +4,8 @@
 
 This directory contains [ReFrame](https://reframe-hpc.readthedocs.io/) regression tests for the Torch Hammer GPU benchmark suite.
 
+The checks match torch-hammer's device label (`GPU0`…, `CPU`, `MPS`), so the same suites also run on CPU-only nodes. Melt is the one check that stays device-specific: GPUs must use the pinned host→device reload, CPU/MPS the in-place refill.
+
 ## Prerequisites
 
 1. **ReFrame** >= 4.0

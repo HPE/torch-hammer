@@ -64,6 +64,10 @@ import reframe as rfm
 import reframe.utility.sanity as sn
 
 
+# Device label in torch-hammer's '[<label> <benchmark>]' lines: GPU0..N, or CPU / MPS without a GPU
+DEVICE = r'(?:GPU\d+|CPU|MPS)'
+
+
 def _no_traceback(check):
     """A Python traceback in either output stream is never an acceptable outcome.
 
@@ -158,7 +162,7 @@ class CI_GEMM(TorchHammerCIBase):
     def validate_run(self):
         return sn.all([
             sn.assert_found(
-                r'\[GPU\d+\s+Batched GEMM\]\s+Performance:', self.stdout,
+                rf'\[{DEVICE}\s+Batched GEMM\]\s+Performance:', self.stdout,
             ),
             sn.assert_found(r'\[OK\] Benchmark run finished', self.stdout),
             _no_traceback(self),
@@ -167,7 +171,7 @@ class CI_GEMM(TorchHammerCIBase):
     @performance_function('GFLOP/s')
     def perf_mean(self):
         return sn.extractsingle(
-            r'\[GPU\d+\s+Batched GEMM\]\s+Performance:\s+[\d.]+\s*/\s*'
+            rf'\[{DEVICE}\s+Batched GEMM\]\s+Performance:\s+[\d.]+\s*/\s*'
             r'([\d.]+)\s*/\s*[\d.]+\s+GFLOP/s',
             self.stdout, 1, float,
         )
@@ -195,7 +199,7 @@ class CI_GEMM_TF32(TorchHammerCIBase):
     def validate_run(self):
         return sn.all([
             sn.assert_found(
-                r'\[GPU\d+\s+Batched GEMM\]\s+Performance:', self.stdout,
+                rf'\[{DEVICE}\s+Batched GEMM\]\s+Performance:', self.stdout,
             ),
             sn.assert_found(r'\[OK\] Benchmark run finished', self.stdout),
             _no_traceback(self),
@@ -204,7 +208,7 @@ class CI_GEMM_TF32(TorchHammerCIBase):
     @performance_function('GFLOP/s')
     def perf_mean(self):
         return sn.extractsingle(
-            r'\[GPU\d+\s+Batched GEMM\]\s+Performance:\s+[\d.]+\s*/\s*'
+            rf'\[{DEVICE}\s+Batched GEMM\]\s+Performance:\s+[\d.]+\s*/\s*'
             r'([\d.]+)\s*/\s*[\d.]+\s+GFLOP/s',
             self.stdout, 1, float,
         )
@@ -237,7 +241,7 @@ class CI_Conv(TorchHammerCIBase):
     def validate_run(self):
         return sn.all([
             sn.assert_found(
-                r'\[GPU\d+\s+Convolution\]\s+Performance:', self.stdout,
+                rf'\[{DEVICE}\s+Convolution\]\s+Performance:', self.stdout,
             ),
             sn.assert_found(r'\[OK\] Benchmark run finished', self.stdout),
             _no_traceback(self),
@@ -246,7 +250,7 @@ class CI_Conv(TorchHammerCIBase):
     @performance_function('img/s')
     def perf_mean(self):
         return sn.extractsingle(
-            r'\[GPU\d+\s+Convolution\]\s+Performance:\s+[\d.]+\s*/\s*'
+            rf'\[{DEVICE}\s+Convolution\]\s+Performance:\s+[\d.]+\s*/\s*'
             r'([\d.]+)\s*/\s*[\d.]+\s+img/s',
             self.stdout, 1, float,
         )
@@ -286,7 +290,7 @@ class CI_FFT(TorchHammerCIBase):
         return sn.all([
             sn.assert_found(r'3-?D FFT', self.stdout),
             sn.assert_found(
-                r'\[GPU\d+\s+3D FFT\]\s+Performance:'
+                rf'\[{DEVICE}\s+3D FFT\]\s+Performance:'
                 r'|3-D FFT\].*not supported.*skipping',
                 self.stdout,
             ),
@@ -297,7 +301,7 @@ class CI_FFT(TorchHammerCIBase):
     @performance_function('GFLOP/s')
     def perf_mean(self):
         return sn.extractsingle(
-            r'\[GPU\d+\s+3D FFT\]\s+Performance:\s+[\d.]+\s*/\s*'
+            rf'\[{DEVICE}\s+3D FFT\]\s+Performance:\s+[\d.]+\s*/\s*'
             r'([\d.]+)\s*/\s*[\d.]+\s+GFLOP/s',
             self.stdout, 1, float,
         )
@@ -328,7 +332,7 @@ class CI_Einsum(TorchHammerCIBase):
     def validate_run(self):
         return sn.all([
             sn.assert_found(
-                r'\[GPU\d+\s+Einsum Attention\]\s+Performance:', self.stdout,
+                rf'\[{DEVICE}\s+Einsum Attention\]\s+Performance:', self.stdout,
             ),
             sn.assert_found(r'\[OK\] Benchmark run finished', self.stdout),
             _no_traceback(self),
@@ -337,7 +341,7 @@ class CI_Einsum(TorchHammerCIBase):
     @performance_function('GFLOP/s')
     def perf_mean(self):
         return sn.extractsingle(
-            r'\[GPU\d+\s+Einsum Attention\]\s+Performance:\s+[\d.]+\s*/\s*'
+            rf'\[{DEVICE}\s+Einsum Attention\]\s+Performance:\s+[\d.]+\s*/\s*'
             r'([\d.]+)\s*/\s*[\d.]+\s+GFLOP/s',
             self.stdout, 1, float,
         )
@@ -370,7 +374,7 @@ class CI_Memory(TorchHammerCIBase):
     def validate_run(self):
         return sn.all([
             sn.assert_found(
-                r'\[GPU\d+\s+Memory Traffic\]\s+Performance:', self.stdout,
+                rf'\[{DEVICE}\s+Memory Traffic\]\s+Performance:', self.stdout,
             ),
             sn.assert_found(r'\[OK\] Benchmark run finished', self.stdout),
             _no_traceback(self),
@@ -379,7 +383,7 @@ class CI_Memory(TorchHammerCIBase):
     @performance_function('GB/s')
     def perf_mean(self):
         return sn.extractsingle(
-            r'\[GPU\d+\s+Memory Traffic\]\s+Performance:\s+[\d.]+\s*/\s*'
+            rf'\[{DEVICE}\s+Memory Traffic\]\s+Performance:\s+[\d.]+\s*/\s*'
             r'([\d.]+)\s*/\s*[\d.]+\s+GB/s',
             self.stdout, 1, float,
         )
@@ -410,7 +414,7 @@ class CI_Heat(TorchHammerCIBase):
     def validate_run(self):
         return sn.all([
             sn.assert_found(
-                r'\[GPU\d+\s+Heat Equation\]\s+Performance:', self.stdout,
+                rf'\[{DEVICE}\s+Heat Equation\]\s+Performance:', self.stdout,
             ),
             sn.assert_found(r'\[OK\] Benchmark run finished', self.stdout),
             _no_traceback(self),
@@ -419,7 +423,7 @@ class CI_Heat(TorchHammerCIBase):
     @performance_function('MLUPS')
     def perf_mean(self):
         return sn.extractsingle(
-            r'\[GPU\d+\s+Heat Equation\]\s+Performance:\s+[\d.]+\s*/\s*'
+            rf'\[{DEVICE}\s+Heat Equation\]\s+Performance:\s+[\d.]+\s*/\s*'
             r'([\d.]+)\s*/\s*[\d.]+\s+MLUPS',
             self.stdout, 1, float,
         )
@@ -462,7 +466,7 @@ class CI_Schrodinger(TorchHammerCIBase):
         return sn.all([
             sn.assert_found(r'Schr.dinger Equation', self.stdout),
             sn.assert_found(
-                r'\[GPU\d+\s+Schr.dinger Equation\]\s+Performance:'
+                rf'\[{DEVICE}\s+Schr.dinger Equation\]\s+Performance:'
                 r'|Schr.dinger Equation\].*not supported.*skipping',
                 self.stdout,
             ),
@@ -473,7 +477,7 @@ class CI_Schrodinger(TorchHammerCIBase):
     @performance_function('iter/s')
     def perf_mean(self):
         return sn.extractsingle(
-            r'\[GPU\d+\s+Schr.dinger Equation\]\s+Performance:\s+[\d.]+\s*/\s*'
+            rf'\[{DEVICE}\s+Schr.dinger Equation\]\s+Performance:\s+[\d.]+\s*/\s*'
             r'([\d.]+)\s*/\s*[\d.]+\s+iter/s',
             self.stdout, 1, float,
         )
@@ -511,7 +515,7 @@ class CI_Atomic(TorchHammerCIBase):
             # Performance line, or a graceful skip (dtype/memory) — one regex, because
             # sn.any() over assert_found() is not an OR: assert_found raises on a miss.
             sn.assert_found(
-                r'\[GPU\d+\s+Atomic Contention\]\s+Performance:'
+                rf'\[{DEVICE}\s+Atomic Contention\]\s+Performance:'
                 r'|Atomic Contention\].*(not supported|skipping)',
                 self.stdout,
             ),
@@ -522,7 +526,7 @@ class CI_Atomic(TorchHammerCIBase):
     @performance_function('Mops/s')
     def perf_mean(self):
         return sn.extractsingle(
-            r'\[GPU\d+\s+Atomic Contention\]\s+Performance:\s+[\d.]+\s*/\s*'
+            rf'\[{DEVICE}\s+Atomic Contention\]\s+Performance:\s+[\d.]+\s*/\s*'
             r'([\d.]+)\s*/\s*[\d.]+\s+Mops/s',
             self.stdout, 1, float,
         )
@@ -558,7 +562,7 @@ class CI_Sparse(TorchHammerCIBase):
         return sn.all([
             sn.assert_found(r'Sparse MM', self.stdout),
             sn.assert_found(
-                r'\[GPU\d+\s+Sparse MM\]\s+Performance:',
+                rf'\[{DEVICE}\s+Sparse MM\]\s+Performance:',
                 self.stdout,
             ),
             _no_traceback(self),
@@ -567,7 +571,7 @@ class CI_Sparse(TorchHammerCIBase):
     @performance_function('GFLOP/s')
     def perf_mean(self):
         return sn.extractsingle(
-            r'\[GPU\d+\s+Sparse MM\]\s+Performance:\s+[\d.]+\s*/\s*'
+            rf'\[{DEVICE}\s+Sparse MM\]\s+Performance:\s+[\d.]+\s*/\s*'
             r'([\d.]+)\s*/\s*[\d.]+\s+GFLOP/s',
             self.stdout, 1, float,
         )
@@ -578,7 +582,7 @@ class CI_Sparse(TorchHammerCIBase):
 # =====================================================================
 @rfm.simple_test
 class CI_Melt(TorchHammerCIBase):
-    """Melt mode on the real CUDA path: pinned host→device reload cool gap.
+    """Melt mode: on GPUs the pinned host→device reload cool gap; on CPU/MPS the in-place refill.
 
     Tiny matrices and a ~5 s cap: this checks the heat/cool loop, the
     calibration, the settled/not-settled verdict and the summary line, not
@@ -605,18 +609,21 @@ class CI_Melt(TorchHammerCIBase):
     @sanity_function
     def validate_run(self):
         return sn.all([
-            sn.assert_found(r'\[GPU\d+\s+Melt\]\s+Cool gap: host→device reload', self.stdout),
-            sn.assert_found(r'\[GPU\d+\s+Melt\]\s+Cool gap: h2d_\w+ reload [\d.]+ ms', self.stdout),
-            sn.assert_found(r'\[GPU\d+\s+Melt\]\s+Calibrated burst', self.stdout),
-            sn.assert_found(r'\[GPU\d+\s+Melt\]\s+(SETTLED|NOT SETTLED) after', self.stdout),
-            sn.assert_found(r'\[GPU\d+\s+Melt\]\s+Performance:', self.stdout),
+            # Each device must take its own cool-gap path: a GPU falling back to the CPU refill is a failure
+            sn.assert_found(r'\[GPU\d+\s+Melt\]\s+Cool gap: host→device reload'
+                            r'|\[(?:CPU|MPS)\s+Melt\]\s+Cool gap: in-place uniform_\(\) refill', self.stdout),
+            sn.assert_found(r'\[GPU\d+\s+Melt\]\s+Cool gap: h2d_\w+ reload [\d.]+ ms'
+                            r'|\[(?:CPU|MPS)\s+Melt\]\s+Cool gap: uniform_ reload [\d.]+ ms', self.stdout),
+            sn.assert_found(rf'\[{DEVICE}\s+Melt\]\s+Calibrated burst', self.stdout),
+            sn.assert_found(rf'\[{DEVICE}\s+Melt\]\s+(SETTLED|NOT SETTLED) after', self.stdout),
+            sn.assert_found(rf'\[{DEVICE}\s+Melt\]\s+Performance:', self.stdout),
             _no_traceback(self),
         ])
 
     @performance_function('GFLOP/s')
     def perf_mean(self):
         return sn.extractsingle(
-            r'\[GPU\d+\s+Melt\]\s+Performance:\s+[\d.]+\s*/\s*'
+            rf'\[{DEVICE}\s+Melt\]\s+Performance:\s+[\d.]+\s*/\s*'
             r'([\d.]+)\s*/\s*[\d.]+\s+GFLOP/s',
             self.stdout, 1, float,
         )
