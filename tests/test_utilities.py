@@ -417,3 +417,49 @@ class TestSummaryTableGrouping:
         display_label = f"{bench['name']} ({dtype})" if not extra_parts else f"{bench['name']} ({dtype}, {', '.join(extra_parts)})"
         
         assert display_label == "Batched GEMM (float64)"
+
+
+class TestPhysicalCoreCount:
+    """Thread count must follow the CPUs the process may use, not the whole node."""
+
+    @staticmethod
+    def _node(root, sockets=2, cores=4):
+        n = sockets * cores
+        for cpu in range(2 * n):  # SMT: cpu and cpu+n share a core
+            core = cpu % n
+            topo = root / f"cpu{cpu}" / "topology"
+            topo.mkdir(parents=True)
+            (topo / "physical_package_id").write_text(f"{core // cores}\n")
+            (topo / "core_id").write_text(f"{core % cores}\n")
+        return str(root)
+
+    def test_whole_node(self, th, tmp_path):
+        cpu_dir = self._node(tmp_path)
+        assert th._get_physical_core_count_early(cpu_dir, allowed=set(range(16))) == 8
+
+    def test_one_cpu_slurm_step_gets_one_core(self, th, tmp_path):
+        cpu_dir = self._node(tmp_path)
+        assert th._get_physical_core_count_early(cpu_dir, allowed={0, 8}) == 1
+
+    def test_partial_allocation_counts_cores_not_threads(self, th, tmp_path):
+        cpu_dir = self._node(tmp_path)
+        assert th._get_physical_core_count_early(cpu_dir, allowed={0, 1, 2, 8, 9, 10, 4}) == 4
+
+    def test_import_time_count_is_whole_node(self, th, tmp_path, monkeypatch):
+        """OMP_NUM_THREADS is set at import for every run, GPU runs included: keep the node count."""
+        cpu_dir = self._node(tmp_path)
+        monkeypatch.setattr(th.os, "sched_getaffinity", lambda pid: {3, 11}, raising=False)
+        monkeypatch.setattr(th, "_STARTUP_CPU_AFFINITY", frozenset({3, 11}))
+        assert th._get_physical_core_count_early(cpu_dir) == 8
+
+    def test_cpu_runs_use_startup_affinity_not_current_thread_mask(self, th, tmp_path, monkeypatch):
+        cpu_dir = self._node(tmp_path)
+        # OpenMP has pinned the main thread to one core; the startup mask still covers the node
+        monkeypatch.setattr(th.os, "sched_getaffinity", lambda pid: {0, 8}, raising=False)
+        monkeypatch.setattr(th, "_STARTUP_CPU_AFFINITY", frozenset(range(16)))
+        assert th.get_physical_core_count(cpu_dir) == 8
+
+    def test_cpu_runs_respect_restricted_startup_affinity(self, th, tmp_path, monkeypatch):
+        cpu_dir = self._node(tmp_path)
+        monkeypatch.setattr(th, "_STARTUP_CPU_AFFINITY", frozenset({3, 11}))
+        assert th.get_physical_core_count(cpu_dir) == 1
