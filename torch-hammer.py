@@ -1146,7 +1146,7 @@ class _SysfsReader:
             try:
                 os.close(fd)
             except OSError:
-                pass
+                pass  # shutdown cleanup: a descriptor that is already closed or invalid needs no handling
         self._fds = {}
 
 
