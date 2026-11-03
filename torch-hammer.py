@@ -20,11 +20,13 @@ from __future__ import annotations
 
 import argparse
 import functools
+import glob
 import json
 import logging
 import os
 import platform
 import random
+import re
 import shutil
 import statistics
 import subprocess
@@ -71,15 +73,21 @@ if "ROCM_PATH" not in os.environ:
 # PRE-TORCH CPU THREADING SETUP  ───────────────────────────────────────
 # Set OpenMP environment BEFORE importing torch for optimal CPU performance.
 # These must be set before the OpenMP runtime initializes.
-def _get_physical_core_count_early() -> int:
-    """Quick physical core detection before torch import."""
+# The process CPU mask, captured before torch loads: OpenMP later pins the main thread to one core
+# (OMP_PROC_BIND), so sched_getaffinity(0) read after that sees one core's CPUs, not the node's.
+_STARTUP_CPU_AFFINITY = frozenset(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None
+
+
+def _get_physical_core_count_early(cpu_dir: str = "/sys/devices/system/cpu", allowed=None) -> int:
+    """Physical cores among ``allowed`` CPUs (the whole node when None), detectable before torch import."""
     try:
-        # Linux: count unique (package, core) pairs
+        # Linux: count unique (package, core) pairs among allowed CPUs
         cores_seen = set()
-        cpu_dir = "/sys/devices/system/cpu"
         if os.path.isdir(cpu_dir):
             for entry in os.listdir(cpu_dir):
                 if entry.startswith("cpu") and entry[3:].isdigit():
+                    if allowed is not None and int(entry[3:]) not in allowed:
+                        continue
                     topo = os.path.join(cpu_dir, entry, "topology", "core_id")
                     pkg = os.path.join(cpu_dir, entry, "topology", "physical_package_id")
                     if os.path.exists(topo) and os.path.exists(pkg):
@@ -102,10 +110,12 @@ def _get_physical_core_count_early() -> int:
         except Exception:
             pass
     # Fallback: assume 2-way SMT
-    return max(1, (os.cpu_count() or 1) // 2)
+    logical = len(allowed) if allowed else (os.cpu_count() or 1)
+    return max(1, logical // 2)
 
 # Set OMP environment early (before torch import) for CPU-only systems
-# These are no-ops if GPU is later detected
+# These are no-ops if GPU is later detected.  Deliberately the whole node: GPU runs inherit this
+# value, and CPU runs size their threads from the process affinity in setup_cpu_threading().
 if "OMP_NUM_THREADS" not in os.environ:
     _early_cores = _get_physical_core_count_early()
     os.environ["OMP_NUM_THREADS"] = str(_early_cores)
@@ -1085,21 +1095,668 @@ class IntelTelemetry(TelemetryBase):
         }
 
 
-# ── CPU fallback ───────────────────────────────────────────────────────
+# ── CPU (Linux procfs/sysfs) ───────────────────────────────────────────
+CPU_CLOCK_SAMPLE_CORES_PER_SOCKET = 8  # Per-core cpufreq reads interrupt the core on ARM (CPPC); cap them
+# Whole-node files grow with the CPU count and are parsed in Python while holding the GIL, which stalls
+# benchmarks that make many short calls; read them at most this often and repeat the last value in between.
+# Power, temperature and memory keep the sample rate.
+CPU_STAT_INTERVAL_S = 1.0
+CPU_CPUINFO_CLOCK_INTERVAL_S = 1.0
+CPU_SET_REFRESH_S = 5.0  # Re-read the process CPU set this often; --cpu-list binds after telemetry starts
+_CPU_ZONE_TYPE_HINTS = ("cpu", "pkg", "package", "soc")  # thermal_zone types that describe the CPU
+# ARM CPUs report only numeric IDs in /proc/cpuinfo ("CPU implementer", "CPU part"), so their names come
+# from these tables.  Only cores torch-hammer has been tested on are listed; others are reported by their
+# raw IDs.  To name a core you have tested, add its IDs here (grep -m2 -E "implementer|part" /proc/cpuinfo).
+_ARM_IMPLEMENTERS = {0x41: "ARM"}
+_ARM_PARTS = {(0x41, 0xd4f): "Neoverse-V2"}  # NVIDIA Grace
+_LEADING_NUMBER_RE = re.compile(r"^\s*(-?\d+(?:\.\d+)?)")  # also parses pm_counters "312 W 1730... us"
+_SOCKET_LABEL_RE = re.compile(r"(?:package id|socket)\s*(\d+)", re.IGNORECASE)
+
+
+class _SysfsReader:
+    """Keeps hot sysfs/procfs files open and re-reads them from offset 0 (cheap at 10 Hz)."""
+
+    def __init__(self):
+        self._fds: Dict[str, int] = {}
+
+    def read(self, path: str, cache: bool = True) -> str:
+        if not cache and path not in self._fds:
+            with open(path, "rb") as f:
+                return f.read(4096).decode(errors="replace")
+        fd = self._fds.get(path)
+        if fd is None:
+            fd = os.open(path, os.O_RDONLY)
+            self._fds[path] = fd
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            return os.read(fd, 4096).decode(errors="replace")
+        except OSError:
+            self._fds.pop(path, None)
+            os.close(fd)
+            raise
+
+    def number(self, path: str, cache: bool = True) -> float:
+        match = _LEADING_NUMBER_RE.match(self.read(path, cache))
+        if not match:
+            raise ValueError(f"no number in {path}")
+        return float(match.group(1))
+
+    def close(self):
+        for fd in self._fds.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self._fds = {}
+
+
 class CpuTelemetry(TelemetryBase):
-    def __init__(self, index):
+    """CPU telemetry from Linux /proc and /sys; identity fields only elsewhere.
+
+    Every source is probed once.  A sensor that is missing or unreadable is left
+    out of ``supported`` and never raises from ``read()``.
+
+    Multi-socket: CPUs map to sockets via ``topology/physical_package_id``.  The
+    benchmark's sockets are those holding a CPU any of its threads may run on
+    (re-read every ``CPU_SET_REFRESH_S``); aggregates cover only them
+    (utilization/clock mean, temperature max, power sum).  On multi-socket nodes
+    ``*_sN`` fields describe each whole socket, whether the benchmark uses it or
+    not, when the sensor-to-socket mapping is unambiguous.
+
+    Utilization is per physical core: a core counts as busy as its busiest
+    hardware thread, so idle SMT siblings don't halve a saturated core.
+    """
+
+    IDENTITY_FIELDS = ["hostname", "vendor", "model", "device_id"]
+    _NOT_TRACKED = ("device_id", "mem_total_MB", "mem_free_MB")
+
+    def __init__(self, index, device=None, root: str = "/", cpus=None):
         import socket
         self.idx = index
-        self._model = platform.machine()
         self.hostname = socket.gethostname().split('.', 1)[0]
+        self._root = root
+        self._vendor = platform.processor() or "CPU"
+        self._model = platform.machine()
+        self._io = _SysfsReader()
+        self._lock = threading.Lock()
+        self.readings: Dict[str, List[float]] = {}
+        self.supported = list(self.IDENTITY_FIELDS)
+
+        # A GPU device that falls back here keeps identity-only telemetry: no extra reads beside a GPU benchmark
+        device_type = getattr(device, "type", "cpu") if device is not None else "cpu"
+        self._sensors = device_type == "cpu" and os.path.isfile(self._p("proc", "stat"))
+        if not self._sensors:
+            return
+        self._probe_identity()
+        self._probe_topology(cpus)
+        self._probe_util()
+        self._probe_clock()
+        self._probe_temp()
+        self._probe_power()
+        self._probe_mem()
+
+    # ── probing ──────────────────────────────────────────────────────
+    def _p(self, *parts) -> str:
+        return os.path.join(self._root, *parts)
+
+    def _try_number(self, path: str, cache: bool = True) -> Optional[float]:
+        try:
+            return self._io.number(path, cache)
+        except (OSError, ValueError):
+            return None
+
+    def _try_text(self, path: str) -> Optional[str]:
+        try:
+            return self._io.read(path, cache=False).strip()
+        except OSError:
+            return None
+
+    def _add_fields(self, *names):
+        for name in names:
+            if name not in self.supported:
+                self.supported.append(name)
+
+    def _probe_identity(self):
+        info: Dict[str, str] = {}
+        try:
+            with open(self._p("proc", "cpuinfo")) as f:
+                for line in f:
+                    if not line.strip():
+                        if info:
+                            break  # the first processor block is enough
+                        continue
+                    key, _, value = line.partition(":")
+                    info.setdefault(key.strip(), value.strip())
+        except OSError:
+            return
+        if info.get("vendor_id"):
+            self._vendor = info["vendor_id"]
+        if info.get("model name"):
+            self._model = " ".join(info["model name"].split())
+        elif "CPU implementer" in info:
+            try:
+                impl = int(info["CPU implementer"], 16)
+                part = int(info.get("CPU part", "0"), 16)
+            except ValueError:
+                return
+            name = _ARM_IMPLEMENTERS.get(impl, f"0x{impl:02x}")
+            self._vendor = "ARM" if impl == 0x41 else f"ARM ({name})"
+            self._model = f"{name} {_ARM_PARTS.get((impl, part), f'part 0x{part:03x}')}"
+
+    @staticmethod
+    def _parse_cpu_ranges(text: str) -> List[int]:
+        cpus = []
+        for part in text.split(","):
+            part = part.strip()
+            if "-" in part:
+                lo, hi = part.split("-")
+                cpus.extend(range(int(lo), int(hi) + 1))
+            elif part:
+                cpus.append(int(part))
+        return cpus
+
+    def _allowed_cpus(self, status_path: str) -> List[int]:
+        for line in (self._try_text(status_path) or "").splitlines():
+            if line.startswith("Cpus_allowed_list:"):
+                try:
+                    return self._parse_cpu_ranges(line.split(":", 1)[1])
+                except ValueError:
+                    return []
+        return []
+
+    def _process_cpus(self) -> List[int]:
+        """CPUs any thread of this process may run on.
+
+        A single thread's mask is misleading: OpenMP (OMP_PROC_BIND) pins the main thread to one
+        core and the telemetry thread pins itself to another, so take the union over all threads.
+        """
+        cpus = set()
+        task_dir = self._p("proc", "self", "task")
+        try:
+            tids = os.listdir(task_dir)
+        except OSError:
+            tids = []
+        for tid in tids:
+            cpus.update(self._allowed_cpus(os.path.join(task_dir, tid, "status")))
+        if not cpus:
+            cpus.update(self._allowed_cpus(self._p("proc", "self", "status")))
+        if cpus:
+            return sorted(cpus)
+        if hasattr(os, "sched_getaffinity"):
+            return sorted(os.sched_getaffinity(0))
+        return list(range(os.cpu_count() or 1))
+
+    def _thread_count(self) -> int:
+        try:
+            return len(os.listdir(self._p("proc", "self", "task")))
+        except OSError:
+            return 0
+
+    def _set_cpus(self, cpus):
+        self._cpus = sorted(c for c in cpus if c in self._socket_of) or sorted(self._socket_of)
+        self._bench_sockets = sorted({self._socket_of[c] for c in self._cpus})
+        self._cpus_read_at = time.monotonic()
+        self._threads_seen = self._thread_count()
+
+    def _refresh_cpus(self, now):
+        if self._fixed_cpus:
+            return
+        # Telemetry starts before OpenMP spawns its workers; re-read as soon as the thread count changes
+        if now - self._cpus_read_at < CPU_SET_REFRESH_S and self._thread_count() == self._threads_seen:
+            return
+        self._set_cpus(self._process_cpus())
+
+    def _probe_topology(self, cpus):
+        cpu_dir = self._p("sys", "devices", "system", "cpu")
+        self._socket_of: Dict[int, int] = {}
+        self._core_of: Dict[int, int] = {}  # CPU -> lowest-numbered hardware thread of its physical core
+        try:
+            entries = os.listdir(cpu_dir)
+        except OSError:
+            entries = []
+        for entry in entries:
+            if entry.startswith("cpu") and entry[3:].isdigit():
+                cpu = int(entry[3:])
+                topo = os.path.join(cpu_dir, entry, "topology")
+                pkg = self._try_number(os.path.join(topo, "physical_package_id"), cache=False)
+                self._socket_of[cpu] = int(pkg) if pkg is not None and pkg >= 0 else 0
+                try:
+                    self._core_of[cpu] = min(self._parse_cpu_ranges(
+                        self._try_text(os.path.join(topo, "thread_siblings_list")) or str(cpu)))
+                except ValueError:
+                    self._core_of[cpu] = cpu
+        self._fixed_cpus = cpus is not None
+        listed = sorted(cpus) if cpus is not None else self._process_cpus()
+        for cpu in listed:
+            self._socket_of.setdefault(cpu, 0)
+            self._core_of.setdefault(cpu, cpu)
+        self._all_sockets = sorted(set(self._socket_of.values()))
+        self._multi_socket = len(self._all_sockets) > 1
+        self._set_cpus(listed)
+
+    def _probe_util(self):
+        self._prev_stat = self._read_proc_stat()  # baseline, so the first read() already has utilization
+        self._last_util: Optional[Dict[str, float]] = None
+        self._util_read_at = float("-inf")
+        if self._prev_stat:
+            self._add_fields("cpu_util")
+            if self._multi_socket:
+                self._add_fields(*(f"cpu_util_s{s}" for s in self._all_sockets))
+
+    def _read_cpuinfo_mhz(self) -> Dict[int, float]:
+        mhz: Dict[int, float] = {}
+        cpu = None
+        try:
+            with open(self._p("proc", "cpuinfo")) as f:
+                for line in f:
+                    if line.startswith("processor"):
+                        cpu = int(line.split(":", 1)[1])
+                    elif line.startswith("cpu MHz") and cpu is not None:
+                        mhz[cpu] = float(line.split(":", 1)[1])
+        except (OSError, ValueError):
+            return {}
+        return mhz
+
+    def _probe_clock(self):
+        # acpi-cpufreq reports the requested P-state in scaling_cur_freq (flat at the base clock while
+        # cores boost well above it); /proc/cpuinfo "cpu MHz" is the delivered clock (APERF/MPERF)
+        self._clock_paths: Dict[int, List[str]] = {}
+        self._cpuinfo_clock: Dict[str, Any] = {}
+        driver = self._try_text(self._p("sys", "devices", "system", "cpu", f"cpu{self._cpus[0]}",
+                                        "cpufreq", "scaling_driver"))
+        if driver == "acpi-cpufreq":
+            mhz = self._read_cpuinfo_mhz()
+            if mhz:
+                self._cpuinfo_clock = {"at": time.monotonic(), "mhz": mhz}
+                self._add_fields("cpu_clock")
+                if self._multi_socket:
+                    self._add_fields(*(f"cpu_clock_s{s}" for s in self._all_sockets))
+                return
+        # Sample whole sockets so per-socket fields are stable when the benchmark's CPU set changes
+        for sock in self._all_sockets:
+            cores = sorted({self._core_of[c] for c in self._socket_of if self._socket_of[c] == sock})
+            step = max(1, len(cores) // CPU_CLOCK_SAMPLE_CORES_PER_SOCKET)
+            paths = []
+            for cpu in cores[::step][:CPU_CLOCK_SAMPLE_CORES_PER_SOCKET]:
+                path = self._p("sys", "devices", "system", "cpu", f"cpu{cpu}", "cpufreq", "scaling_cur_freq")
+                if self._try_number(path) is not None:
+                    paths.append(path)
+            if paths:
+                self._clock_paths[sock] = paths
+        if self._clock_paths:
+            self._add_fields("cpu_clock")
+            if self._multi_socket:
+                self._add_fields(*(f"cpu_clock_s{s}" for s in sorted(self._clock_paths)))
+
+    def _hwmon_dirs(self) -> List[Tuple[str, str]]:
+        base = self._p("sys", "class", "hwmon")
+        try:
+            entries = sorted(os.listdir(base))
+        except OSError:
+            return []
+        out = []
+        for entry in entries:
+            path = os.path.join(base, entry)
+            out.append((path, (self._try_text(os.path.join(path, "name")) or "").lower()))
+        return out
+
+    def _probe_temp(self):
+        # A sensor is either mapped to a socket ({socket: path}) or unmapped (aggregate only)
+        self._temp_mapped: Dict[int, str] = {}
+        self._temp_unmapped: List[str] = []
+        amd = []
+        for path, name in self._hwmon_dirs():
+            if name == "coretemp":
+                for label_file in sorted(glob.glob(os.path.join(path, "temp*_label"))):
+                    m = re.match(r"package id\s*(\d+)", self._try_text(label_file) or "", re.IGNORECASE)
+                    value_path = label_file[:-len("_label")] + "_input"
+                    if m and self._try_number(value_path) is not None:
+                        self._temp_mapped[int(m.group(1))] = value_path
+            elif name in ("k10temp", "zenpower"):
+                labels = {(self._try_text(f) or "").lower(): f[:-len("_label")] + "_input"
+                          for f in sorted(glob.glob(os.path.join(path, "temp*_label")))}
+                # Tctl carries an offset on some older parts, so prefer Tdie
+                chosen = labels.get("tdie") or labels.get("tctl") or os.path.join(path, "temp1_input")
+                if self._try_number(chosen) is not None:
+                    pci = os.path.basename(os.path.realpath(os.path.join(path, "device")))
+                    amd.append((pci, chosen))
+        if amd:
+            amd.sort()  # PCI address order: 00:18.3 is socket 0, 00:19.3 socket 1, ...
+            if len(amd) == len(self._all_sockets):
+                self._temp_mapped.update({s: p for s, (_, p) in zip(self._all_sockets, amd)})
+            else:
+                self._temp_unmapped.extend(p for _, p in amd)
+        if not self._temp_mapped and not self._temp_unmapped:
+            for zone in sorted(glob.glob(self._p("sys", "class", "thermal", "thermal_zone*"))):
+                zone_type = (self._try_text(os.path.join(zone, "type")) or "").lower()
+                value_path = os.path.join(zone, "temp")
+                if any(h in zone_type for h in _CPU_ZONE_TYPE_HINTS) and self._try_number(value_path) is not None:
+                    self._temp_unmapped.append(value_path)
+        if self._temp_mapped or self._temp_unmapped:
+            self._add_fields("temp_cpu_C")
+            if self._multi_socket and not self._temp_unmapped:
+                self._add_fields(*(f"temp_cpu_C_s{s}" for s in sorted(self._temp_mapped)))
+
+    def _probe_power(self):
+        """Pick the first readable power source.
+
+        Standard Linux first: RAPL powercap, AMD HSMP hwmon (per socket, world-readable on EPYC),
+        then other CPU hwmon sensors; Cray pm_counters (board level) last.
+        """
+        self._power_kind: Optional[str] = None  # "gauge" (W), "rapl" (µJ counter) or "hwmon" (µW)
+        self._power_mapped: Dict[int, str] = {}
+        self._power_unmapped: Optional[str] = None
+        self._rapl_prev: Dict[int, Tuple[float, float]] = {}
+        self._rapl_range: Dict[int, float] = {}
+        self._cap_paths: Dict[int, str] = {}
+        self._cap_values: Dict[int, float] = {}
+        self._caps_read_at = float("-inf")
+        for probe in (self._probe_rapl, self._probe_hsmp, self._probe_hwmon_cpu_power, self._probe_pm_counters):
+            if probe():
+                break
+        if self._power_kind:
+            self._add_fields("power_W")
+            if self._multi_socket and self._power_mapped:
+                self._add_fields(*(f"power_W_s{s}" for s in sorted(self._power_mapped)))
+        if self._cap_paths:
+            self._add_fields("power_cap_W")
+            if self._multi_socket:
+                self._add_fields(*(f"power_cap_W_s{s}" for s in sorted(self._cap_paths)))
+
+    def _probe_rapl(self) -> bool:
+        for zone in sorted(glob.glob(self._p("sys", "class", "powercap", "intel-rapl:*"))):
+            if os.path.basename(zone).count(":") != 1:
+                continue  # sub-domains (core, dram) live at intel-rapl:N:M
+            m = re.match(r"package-(\d+)$", self._try_text(os.path.join(zone, "name")) or "")
+            if not m:
+                continue
+            energy = os.path.join(zone, "energy_uj")
+            max_range = self._try_number(os.path.join(zone, "max_energy_range_uj"), cache=False)
+            value = self._try_number(energy)
+            if max_range and value is not None:
+                sock = int(m.group(1))
+                self._power_mapped[sock] = energy
+                self._rapl_range[sock] = max_range
+                self._rapl_prev[sock] = (value, time.monotonic())
+            else:
+                logging.debug(f"RAPL {energy} not readable (root-only since Linux 5.10); skipping")
+        if self._power_mapped:
+            self._power_kind = "rapl"
+            return True
+        return False
+
+    def _probe_hsmp(self) -> bool:
+        """AMD HSMP: one amd_hsmp_hwmon per socket, power1_input (µW) and power1_cap (µW)."""
+        found = []
+        for path, name in self._hwmon_dirs():
+            if name != "amd_hsmp_hwmon":
+                continue
+            value = os.path.join(path, "power1_input")
+            if self._try_number(value) is not None:
+                acpi = os.path.basename(os.path.realpath(os.path.join(path, "device")))
+                found.append((acpi, value, os.path.join(path, "power1_cap")))
+        if not found or len(found) != len(self._all_sockets):
+            if found:
+                logging.debug(f"{len(found)} amd_hsmp_hwmon devices for {len(self._all_sockets)} sockets; skipping")
+            return False
+        found.sort()  # ACPI instance order (AMDI0097:00, :01, ...) is socket order
+        for sock, (_, value, cap) in zip(self._all_sockets, found):
+            self._power_mapped[sock] = value
+            if self._try_number(cap, cache=False) is not None:
+                self._cap_paths[sock] = cap
+        self._power_kind = "hwmon"
+        return True
+
+    def _probe_hwmon_cpu_power(self) -> bool:
+        mapped: Dict[int, str] = {}
+        unmapped: Optional[str] = None
+        for path, name in self._hwmon_dirs():
+            for value_path in sorted(glob.glob(os.path.join(path, "power*_average")) +
+                                     glob.glob(os.path.join(path, "power*_input"))):
+                stem = re.sub(r"_(average|input)$", "", value_path)
+                label = self._try_text(stem + "_label") or self._try_text(stem + "_oem_info") or ""
+                text = f"{name} {label}".lower()
+                # Only CPU sensors: module/node meters would include GPUs or memory
+                if "cpu" not in text or "module" in text or self._try_number(value_path) is None:
+                    continue
+                m = _SOCKET_LABEL_RE.search(label)
+                if m:
+                    mapped.setdefault(int(m.group(1)), value_path)
+                elif unmapped is None:
+                    unmapped = value_path
+        if mapped and set(self._bench_sockets) <= set(mapped):
+            self._power_kind, self._power_mapped = "hwmon", mapped
+        elif unmapped:
+            self._power_kind, self._power_unmapped = "hwmon", unmapped
+        return self._power_kind is not None
+
+    def _probe_pm_counters(self) -> bool:
+        pm = self._p("sys", "cray", "pm_counters")
+        per_socket = {s: os.path.join(pm, f"cpu{s}_power") for s in self._all_sockets}
+        if self._multi_socket and all(self._try_number(p) is not None for p in per_socket.values()):
+            self._power_kind, self._power_mapped = "gauge", per_socket
+        elif self._try_number(os.path.join(pm, "cpu_power")) is not None:
+            # Node CPU total: includes sockets outside the benchmark's affinity set
+            self._power_kind, self._power_unmapped = "gauge", os.path.join(pm, "cpu_power")
+        return self._power_kind is not None
+
+    def _probe_mem(self):
+        if self._read_meminfo() is not None:
+            self._add_fields("mem_used_MB", "mem_total_MB", "mem_free_MB")
+
+    # ── sampling ─────────────────────────────────────────────────────
+    def _read_proc_stat(self) -> Optional[Dict[int, Tuple[int, int]]]:
+        out: Dict[int, Tuple[int, int]] = {}
+        try:
+            with open(self._p("proc", "stat")) as f:
+                for line in f:
+                    if not line.startswith("cpu"):
+                        break  # per-CPU lines come first; skip the long intr/softirq lines
+                    fields = line.split()
+                    if fields[0] == "cpu":
+                        continue
+                    ticks = [int(v) for v in fields[1:9]]  # user..steal; guest is already in user
+                    idle = ticks[3] + (ticks[4] if len(ticks) > 4 else 0)  # idle + iowait
+                    out[int(fields[0][3:])] = (sum(ticks), idle)
+        except (OSError, ValueError, IndexError):
+            return None
+        return out or None
+
+    def _read_meminfo(self) -> Optional[Dict[str, float]]:
+        try:
+            mem = {}
+            for line in self._io.read(self._p("proc", "meminfo")).splitlines():
+                key, _, rest = line.partition(":")
+                if key in ("MemTotal", "MemAvailable"):
+                    mem[key] = float(rest.split()[0]) / 1024.0  # kB -> MB
+            return mem if "MemTotal" in mem and "MemAvailable" in mem else None
+        except (OSError, ValueError, IndexError):
+            return None
+
+    def _sample_util(self, d, now):
+        if self._last_util is not None and now - self._util_read_at < CPU_STAT_INTERVAL_S:
+            d.update(self._last_util)
+            return
+        util: Dict[str, float] = {}
+        self._compute_util(util)
+        self._last_util, self._util_read_at = util, now
+        d.update(util)
+
+    def _compute_util(self, d):
+        cur = self._read_proc_stat()
+        prev, self._prev_stat = self._prev_stat, cur
+        if not cur or not prev:
+            return
+        core_busy: Dict[int, float] = {}  # physical core -> busiest hardware thread
+        for cpu, (total, idle) in cur.items():
+            if cpu not in prev or cpu not in self._socket_of:
+                continue
+            d_total = total - prev[cpu][0]
+            if d_total <= 0:
+                continue
+            busy = min(100.0, max(0.0, 100.0 * (d_total - (idle - prev[cpu][1])) / d_total))
+            core = self._core_of[cpu]
+            core_busy[core] = max(busy, core_busy.get(core, 0.0))
+        bench_cores = {self._core_of[c] for c in self._cpus}
+        values = [b for core, b in core_busy.items() if core in bench_cores]
+        if values:
+            d["cpu_util"] = round(statistics.mean(values), 1)
+        if self._multi_socket:
+            per_socket: Dict[int, List[float]] = {}
+            for core, b in core_busy.items():
+                per_socket.setdefault(self._socket_of[core], []).append(b)
+            for sock, vals in sorted(per_socket.items()):
+                d[f"cpu_util_s{sock}"] = round(statistics.mean(vals), 1)
+
+    def _sample_clock(self, d, now):
+        if self._cpuinfo_clock:
+            self._sample_cpuinfo_clock(d, now)
+            return
+        per_socket = {}
+        for sock, paths in self._clock_paths.items():
+            vals = [v for v in (self._try_number(p) for p in paths) if v is not None]
+            if vals:
+                per_socket[sock] = statistics.mean(vals) / 1000.0  # kHz -> MHz
+        bench = [mhz for sock, mhz in per_socket.items() if sock in self._bench_sockets]
+        if bench:
+            d["cpu_clock"] = int(round(statistics.mean(bench)))
+            if self._multi_socket:
+                for sock, mhz in sorted(per_socket.items()):
+                    d[f"cpu_clock_s{sock}"] = int(round(mhz))
+
+    def _sample_cpuinfo_clock(self, d, now):
+        cache = self._cpuinfo_clock
+        if now - cache["at"] >= CPU_CPUINFO_CLOCK_INTERVAL_S:
+            mhz = self._read_cpuinfo_mhz()
+            if mhz:
+                cache["mhz"], cache["at"] = mhz, now
+        core_mhz: Dict[int, float] = {}  # SMT siblings share a clock; an idle sibling under-reports it
+        for cpu, value in cache["mhz"].items():
+            if cpu in self._core_of:
+                core = self._core_of[cpu]
+                core_mhz[core] = max(value, core_mhz.get(core, 0.0))
+        bench_cores = {self._core_of[c] for c in self._cpus}
+        bench = [v for core, v in core_mhz.items() if core in bench_cores]
+        if bench:
+            d["cpu_clock"] = int(round(statistics.mean(bench)))
+        if self._multi_socket:
+            per_socket: Dict[int, List[float]] = {}
+            for core, v in core_mhz.items():
+                per_socket.setdefault(self._socket_of[core], []).append(v)
+            for sock, vals in sorted(per_socket.items()):
+                d[f"cpu_clock_s{sock}"] = int(round(statistics.mean(vals)))
+
+    def _sample_temp(self, d, now):
+        mapped = {}
+        for sock, path in self._temp_mapped.items():
+            value = self._try_number(path)
+            if value is not None:
+                mapped[sock] = value / 1000.0  # m°C -> °C
+        unmapped = [v / 1000.0 for v in (self._try_number(p) for p in self._temp_unmapped) if v is not None]
+        bench = [t for s, t in mapped.items() if s in self._bench_sockets] or list(mapped.values())
+        candidates = bench + unmapped
+        if candidates:
+            d["temp_cpu_C"] = round(max(candidates), 1)  # the hottest socket is the one that throttles
+            if self._multi_socket and not self._temp_unmapped:
+                for sock, temp in sorted(mapped.items()):
+                    d[f"temp_cpu_C_s{sock}"] = round(temp, 1)
+
+    def _sample_power(self, d, now):
+        scale = 1e-6 if self._power_kind == "hwmon" else 1.0  # hwmon reports µW
+        if self._power_unmapped:
+            value = self._try_number(self._power_unmapped)
+            if value is not None:
+                d["power_W"] = round(value * scale, 1)
+            return
+        per_socket: Dict[int, float] = {}
+        for sock, path in self._power_mapped.items():
+            value = self._try_number(path)
+            if value is None:
+                continue
+            if self._power_kind == "rapl":
+                prev = self._rapl_prev.get(sock)
+                self._rapl_prev[sock] = (value, now)
+                if prev is None or now <= prev[1]:
+                    continue
+                delta = value - prev[0]
+                if delta < 0:
+                    delta += self._rapl_range[sock]  # counter wrapped
+                per_socket[sock] = delta / 1e6 / (now - prev[1])  # µJ over s -> W
+            else:
+                per_socket[sock] = value * scale
+        bench = [w for s, w in per_socket.items() if s in self._bench_sockets]
+        if bench:
+            d["power_W"] = round(sum(bench), 1)
+        if self._multi_socket:
+            for sock, watts in sorted(per_socket.items()):
+                d[f"power_W_s{sock}"] = round(watts, 1)
+
+    def _sample_power_cap(self, d, now):
+        # Caps change only by admin action; each HSMP read is an SMU mailbox call, so read them rarely
+        if now - self._caps_read_at >= CPU_SET_REFRESH_S:
+            for sock, path in self._cap_paths.items():
+                value = self._try_number(path, cache=False)
+                if value is not None:
+                    self._cap_values[sock] = value * 1e-6  # µW -> W
+            self._caps_read_at = now
+        bench = [w for s, w in self._cap_values.items() if s in self._bench_sockets]
+        if bench:
+            d["power_cap_W"] = round(sum(bench), 1)
+        if self._multi_socket:
+            for sock, watts in sorted(self._cap_values.items()):
+                d[f"power_cap_W_s{sock}"] = round(watts, 1)
+
+    def _sample_mem(self, d, now):
+        mem = self._read_meminfo()
+        if mem:
+            d["mem_total_MB"] = mem["MemTotal"]
+            d["mem_free_MB"] = mem["MemAvailable"]
+            d["mem_used_MB"] = mem["MemTotal"] - mem["MemAvailable"]
 
     def read(self):
-        return {
-            "vendor": platform.processor() or "CPU",
+        d = {
+            "vendor": self._vendor,
             "model": self._model,
             "device_id": self.idx,
             "hostname": self.hostname,
         }
+        if not self._sensors:
+            return d
+        # Called from the telemetry thread and from the main thread (summaries); rate state must not interleave
+        with self._lock:
+            now = time.monotonic()
+            try:
+                self._refresh_cpus(now)
+            except Exception as e:
+                logging.debug(f"CPU telemetry CPU-set refresh failed: {e}")
+            for sample in (self._sample_util, self._sample_clock, self._sample_temp,
+                           self._sample_power, self._sample_power_cap, self._sample_mem):
+                try:
+                    sample(d, now)
+                except Exception as e:  # a sensor quirk must never break the poll loop
+                    logging.debug(f"CPU telemetry {sample.__name__} failed: {e}")
+            for key, value in d.items():
+                if key not in self._NOT_TRACKED and isinstance(value, (int, float)):
+                    self.readings.setdefault(key, []).append(value)
+        return d
+
+    def get_stats(self, skip_first_n=0):
+        stats = {}
+        with self._lock:
+            for key, vals in self.readings.items():
+                if vals:
+                    stats[f"{key}_min"] = min(vals)
+                    vals_for_mean = vals[skip_first_n:] if len(vals) > skip_first_n else vals
+                    stats[f"{key}_mean"] = statistics.mean(vals_for_mean)
+                    stats[f"{key}_max"] = max(vals)
+        return stats
+
+    def reset_stats(self):
+        with self._lock:
+            self.readings = {}
+
+    def shutdown(self):
+        self._io.close()
 
 
 # ── Factory selecting best available backend ───────────────────────────
@@ -1118,7 +1775,7 @@ def make_telemetry(index: int, device: torch.device) -> TelemetryBase:
             pass
     if device.type == "xpu":
         return IntelTelemetry(index)
-    return CpuTelemetry(index)
+    return CpuTelemetry(index, device)
 
 
 # ── Background Telemetry Thread ────────────────────────────────────────
@@ -1392,6 +2049,69 @@ class Timer:
 
 # ───────────────────────────────────────────────────────────────────────
 # 4.  SMALL HELPERS  ───────────────────────────────────────────────────
+CPU_FILL_CHUNK_ELEMS = 1 << 22  # fixed chunk size, so CPU operand values don't depend on the thread count
+# (cpus, interleave nodes) for the fill threads, set by configure_cpu_fill() on CPU runs; None leaves them as created
+_CPU_FILL_PLACEMENT: Optional[Tuple[List[int], List[int]]] = None
+
+
+def random_operand(shape, dtype, dev, spread: bool = True) -> torch.Tensor:
+    """Uniform [0, 1) operand of ``shape`` on ``dev``.
+
+    Non-CPU devices get exactly ``torch.rand`` as before (``spread`` is ignored).  On CPU, ``torch.rand``
+    fills on a single thread, so a large operand takes seconds to minutes; fill it in
+    fixed-size chunks across a thread pool instead, spreading its pages over the run's NUMA nodes.
+    Each chunk has its own generator seeded from the default CPU generator, so ``torch.manual_seed``
+    still fixes the values whatever the thread count.
+
+    ``spread=False`` fills on the calling thread, keeping the operand on its NUMA node; use it for
+    operands read by a single-threaded kernel, which pays for every remote page.
+    """
+    if dev.type != "cpu":
+        return torch.rand(*shape, device=dev, dtype=dtype)
+    if not spread:
+        return torch.rand(*shape, dtype=dtype)
+    return _parallel_rand_cpu(tuple(shape), dtype)
+
+
+def _parallel_rand_cpu(shape, dtype, workers: Optional[int] = None) -> torch.Tensor:
+    out = torch.empty(shape, dtype=dtype)
+    flat = out.view(-1)
+    n_chunks = -(-flat.numel() // CPU_FILL_CHUNK_ELEMS)
+    if n_chunks == 0:
+        return out
+    base = int(torch.randint(0, 2**62, (1,)).item())
+
+    def fill(i):
+        chunk = flat[i * CPU_FILL_CHUNK_ELEMS:(i + 1) * CPU_FILL_CHUNK_ELEMS]
+        torch.rand(chunk.shape, generator=torch.Generator().manual_seed(base + i), dtype=dtype, out=chunk)
+
+    workers = min(workers or torch.get_num_threads(), n_chunks)
+    if workers <= 1:
+        for i in range(n_chunks):
+            fill(i)
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+        # torch.rand releases the GIL, so chunks fill in parallel
+        with ThreadPoolExecutor(workers, initializer=_place_fill_thread, initargs=(_CPU_FILL_PLACEMENT,)) as pool:
+            list(pool.map(fill, range(n_chunks)))
+    return out
+
+
+def _place_fill_thread(placement) -> None:
+    """Pool initializer: run on all the run's CPUs (threads inherit the creator's mask, and OpenMP may
+    have pinned the main thread to one core) and interleave the pages this thread first touches."""
+    if placement is None:
+        return
+    cpus, nodes = placement
+    try:
+        if cpus and hasattr(os, "sched_setaffinity"):
+            os.sched_setaffinity(0, cpus)
+        if nodes:
+            _set_mempolicy_interleave(nodes)
+    except OSError as e:
+        logging.debug(f"CPU fill thread placement failed: {e}")
+
+
 def gflops(flops: float, secs: float) -> float:
     return flops / secs / 1e9
 
@@ -1408,7 +2128,7 @@ def _format_telemetry_compact(tel_data: Dict[str, Any]) -> str:
     # Determine appropriate label
     if vendor in ('NVIDIA Corporation', 'Advanced Micro Devices, Inc. [AMD/ATI]', 'NVIDIA', 'AMD'):
         parts.append(f"GPU{device_id}")
-    elif vendor in ('CPU', 'GenuineIntel', 'AuthenticAMD') or \
+    elif vendor in ('CPU', 'GenuineIntel', 'AuthenticAMD') or vendor.startswith('ARM') or \
          'arm' in model.lower() or 'x86' in model.lower() or \
          model in ('arm64', 'aarch64', 'x86_64', 'i386', 'i686'):
         # CPU or Apple Silicon (MPS) - show model name
@@ -1425,10 +2145,14 @@ def _format_telemetry_compact(tel_data: Dict[str, Any]) -> str:
         parts.append(f"SM:{tel_data['sm_util']}%")
     if 'mem_bw_util' in tel_data and tel_data['mem_bw_util'] != 'N/A':
         parts.append(f"MemBW:{tel_data['mem_bw_util']}%")
+    if 'cpu_util' in tel_data:
+        parts.append(f"Util:{tel_data['cpu_util']:.0f}%")
     
     # Temperature
     if 'temp_gpu_C' in tel_data and tel_data['temp_gpu_C'] != 'N/A':
         parts.append(f"Temp:{tel_data['temp_gpu_C']}°C")
+    if 'temp_cpu_C' in tel_data:
+        parts.append(f"Temp:{tel_data['temp_cpu_C']:.0f}°C")
     
     # Power - handle both numeric and string values safely
     if 'power_W' in tel_data and tel_data['power_W'] != 'N/A':
@@ -1440,6 +2164,8 @@ def _format_telemetry_compact(tel_data: Dict[str, Any]) -> str:
     # Clock
     if 'gpu_clock' in tel_data and tel_data['gpu_clock'] != 'N/A':
         parts.append(f"Clock:{tel_data['gpu_clock']}MHz")
+    if 'cpu_clock' in tel_data:
+        parts.append(f"Clock:{tel_data['cpu_clock']}MHz")
     
     # Memory usage
     if 'mem_used_MB' in tel_data and tel_data['mem_used_MB'] != 'N/A':
@@ -1456,6 +2182,12 @@ def _format_telemetry_compact(tel_data: Dict[str, Any]) -> str:
 
 # ───────────────────────────────────────────────────────────────────────
 # 4a′. COMPACT CSV HELPERS  ────────────────────────────────────────────
+
+def _temp_max_c(tel_s: Dict[str, Any]) -> str:
+    """Max device temperature for the compact CSV: GPU die, else CPU package."""
+    temp = tel_s.get('temp_gpu_C_max') or tel_s.get('temp_cpu_C_max')
+    return f"{temp:.0f}" if temp else ''
+
 
 def _compact_csv_columns(verbose: bool = False) -> list:
     """Return ordered column names for compact CSV output.
@@ -1522,7 +2254,7 @@ def _compact_row(perf: dict, tel_data: dict, gpu_index: int,
         'max':            f"{perf['max']:.4f}",
         'unit':           perf['unit'],
         'power_avg_w':    f"{tel_s.get('power_W_mean', 0):.1f}" if tel_s.get('power_W_mean') else '',
-        'temp_max_c':     f"{tel_s.get('temp_gpu_C_max', 0):.0f}" if tel_s.get('temp_gpu_C_max') else '',
+        'temp_max_c':     _temp_max_c(tel_s),
     }
     if verbose:
         row.update({
@@ -2025,7 +2757,7 @@ def _build_syslog_row(perf: dict, tel_data: dict, gpu_index: int,
         'max':         f"{perf['max']:.4f}",
         'unit':        perf['unit'],
         'power_avg_w': f"{tel_s.get('power_W_mean', 0):.1f}" if tel_s.get('power_W_mean') else '',
-        'temp_max_c':  f"{tel_s.get('temp_gpu_C_max', 0):.0f}" if tel_s.get('temp_gpu_C_max') else '',
+        'temp_max_c':  _temp_max_c(tel_s),
         'status':      'PASS',
     })
 
@@ -2204,12 +2936,18 @@ def _log_summary(name, vals, unit, logger, tel, device, params=None, baselines=N
             logger.info(f"[{dev_label} {name}]   GPU Temp:        {tel_stats['temp_gpu_C_min']:.0f}°C / {tel_stats['temp_gpu_C_mean']:.0f}°C / {tel_stats['temp_gpu_C_max']:.0f}°C")
         if 'temp_hbm_C_min' in tel_stats:
             logger.info(f"[{dev_label} {name}]   HBM Temp:        {tel_stats['temp_hbm_C_min']:.0f}°C / {tel_stats['temp_hbm_C_mean']:.0f}°C / {tel_stats['temp_hbm_C_max']:.0f}°C")
+        if 'cpu_util_min' in tel_stats:
+            logger.info(f"[{dev_label} {name}]   CPU Utilization: {tel_stats['cpu_util_min']:.0f}% / {tel_stats['cpu_util_mean']:.0f}% / {tel_stats['cpu_util_max']:.0f}%")
+        if 'temp_cpu_C_min' in tel_stats:
+            logger.info(f"[{dev_label} {name}]   CPU Temp:        {tel_stats['temp_cpu_C_min']:.0f}°C / {tel_stats['temp_cpu_C_mean']:.0f}°C / {tel_stats['temp_cpu_C_max']:.0f}°C")
         
         if 'power_W_min' in tel_stats:
             logger.info(f"[{dev_label} {name}]   Power:           {tel_stats['power_W_min']:.0f}W / {tel_stats['power_W_mean']:.0f}W / {tel_stats['power_W_max']:.0f}W")
         
         if 'gpu_clock_min' in tel_stats:
             logger.info(f"[{dev_label} {name}]   GPU Clock:       {tel_stats['gpu_clock_min']:.0f}MHz / {tel_stats['gpu_clock_mean']:.0f}MHz / {tel_stats['gpu_clock_max']:.0f}MHz")
+        if 'cpu_clock_min' in tel_stats:
+            logger.info(f"[{dev_label} {name}]   CPU Clock:       {tel_stats['cpu_clock_min']:.0f}MHz / {tel_stats['cpu_clock_mean']:.0f}MHz / {tel_stats['cpu_clock_max']:.0f}MHz")
         
         if 'mem_used_MB_min' in tel_stats:
             min_gb = tel_stats['mem_used_MB_min'] / 1024
@@ -2503,46 +3241,13 @@ def parse_cpu_list(cpu_list_str: str) -> List[int]:
     return sorted(set(cpus))
 
 
-def get_physical_core_count() -> int:
-    """Get number of physical CPU cores (excluding hyperthreads).
-    
-    Uses /sys/devices/system/cpu topology on Linux, falls back to os.cpu_count()/2.
+def get_physical_core_count(cpu_dir: str = "/sys/devices/system/cpu") -> int:
+    """Physical CPU cores this process may run on (excluding hyperthreads).
+
+    Counting the whole node oversubscribes restricted allocations: a one-CPU Slurm step
+    (``srun --pty bash``) would run one thread per node core on that single core.
     """
-    # Linux: count unique core_id values across all CPUs
-    try:
-        cores_seen = set()
-        cpu_dir = "/sys/devices/system/cpu"
-        if os.path.isdir(cpu_dir):
-            for entry in os.listdir(cpu_dir):
-                if entry.startswith("cpu") and entry[3:].isdigit():
-                    topology_path = os.path.join(cpu_dir, entry, "topology", "core_id")
-                    package_path = os.path.join(cpu_dir, entry, "topology", "physical_package_id")
-                    if os.path.exists(topology_path) and os.path.exists(package_path):
-                        with open(topology_path) as f:
-                            core_id = f.read().strip()
-                        with open(package_path) as f:
-                            package_id = f.read().strip()
-                        # Unique physical core = (package_id, core_id) tuple
-                        cores_seen.add((package_id, core_id))
-            if cores_seen:
-                return len(cores_seen)
-    except Exception:
-        pass
-    
-    # macOS: use sysctl
-    if platform.system() == "Darwin":
-        try:
-            result = subprocess.run(
-                ["sysctl", "-n", "hw.physicalcpu"],
-                capture_output=True, text=True, check=True
-            )
-            return int(result.stdout.strip())
-        except Exception:
-            pass
-    
-    # Fallback: assume 2-way SMT (hyperthreading)
-    logical_cpus = os.cpu_count() or 1
-    return max(1, logical_cpus // 2)
+    return _get_physical_core_count_early(cpu_dir, allowed=_STARTUP_CPU_AFFINITY)
 
 
 def setup_cpu_threading(device: torch.device, args, log) -> None:
@@ -2558,7 +3263,12 @@ def setup_cpu_threading(device: torch.device, args, log) -> None:
     """
     if device.type != "cpu":
         return  # Only for CPU-only mode
-    
+    cpus = _setup_cpu_thread_count(args, log)
+    configure_cpu_fill(cpus, getattr(args, 'cpu_interleave', True), log)
+
+
+def _setup_cpu_thread_count(args, log) -> List[int]:
+    """Size torch's thread pool for a CPU run; return the CPUs the benchmark may use."""
     # Check for user override via --cpu-list
     if hasattr(args, 'cpu_list') and args.cpu_list:
         cpus = parse_cpu_list(args.cpu_list)
@@ -2576,13 +3286,17 @@ def setup_cpu_threading(device: torch.device, args, log) -> None:
                 os.environ["GOMP_CPU_AFFINITY"] = format_cpu_list(cpus).replace(",", " ")
             except Exception as e:
                 log.warning(f"Could not set CPU affinity: {e}")
-        return
+        return cpus
     
     # Default: use all physical cores (no hyperthreads)
     physical_cores = get_physical_core_count()
-    logical_cores = os.cpu_count() or 1
+    logical_cores = len(_STARTUP_CPU_AFFINITY) if _STARTUP_CPU_AFFINITY else (os.cpu_count() or 1)
+    node_logical = os.cpu_count() or logical_cores
     
-    log.info(f"CPU threading: {physical_cores} physical cores detected ({logical_cores} logical)")
+    log.info(f"CPU threading: {physical_cores} physical cores available ({logical_cores} logical)")
+    if logical_cores < node_logical:
+        log.warning(f"CPU threading: process may use only {logical_cores} of {node_logical} logical CPUs "
+                    f"(e.g. Slurm step without -c); request more CPUs to load the whole node")
     
     # Set PyTorch thread count (works at runtime)
     torch.set_num_threads(physical_cores)
@@ -2591,6 +3305,112 @@ def setup_cpu_threading(device: torch.device, args, log) -> None:
     # Verify they match our detected core count
     omp_threads = os.environ.get("OMP_NUM_THREADS", "not set")
     log.info(f"CPU threading: torch.set_num_threads({physical_cores}), OMP_NUM_THREADS={omp_threads}")
+    return sorted(_STARTUP_CPU_AFFINITY) if _STARTUP_CPU_AFFINITY else list(range(os.cpu_count() or 1))
+
+
+# Linux set_mempolicy(2); glibc has no wrapper, so call the syscall directly
+_MPOL_INTERLEAVE = 3
+_SET_MEMPOLICY_SYSCALL = {"x86_64": 238, "aarch64": 237}
+
+
+def _parse_id_list(text: str) -> List[int]:
+    """Parse a sysfs id list such as ``0-3,16-19`` (empty text gives [])."""
+    ids = []
+    for part in text.strip().split(","):
+        part = part.strip()
+        if "-" in part:
+            lo, hi = part.split("-")
+            ids.extend(range(int(lo), int(hi) + 1))
+        elif part:
+            ids.append(int(part))
+    return ids
+
+
+def numa_nodes_for_cpus(cpus, node_dir: str = "/sys/devices/system/node") -> List[int]:
+    """NUMA nodes that hold at least one of ``cpus`` and have memory.
+
+    CPU-less memory nodes (CXL, HBM) are excluded: interleaving onto them would slow the benchmark.
+    """
+    cpus = set(cpus)
+    try:
+        with open(os.path.join(node_dir, "has_memory")) as f:
+            with_memory = set(_parse_id_list(f.read()))
+        entries = os.listdir(node_dir)
+    except (OSError, ValueError):
+        return []
+    nodes = []
+    for entry in entries:
+        if not (entry.startswith("node") and entry[4:].isdigit()):
+            continue
+        node = int(entry[4:])
+        try:
+            with open(os.path.join(node_dir, entry, "cpulist")) as f:
+                node_cpus = set(_parse_id_list(f.read()))
+        except (OSError, ValueError):
+            continue
+        if node in with_memory and node_cpus & cpus:
+            nodes.append(node)
+    return sorted(nodes)
+
+
+def _set_mempolicy_interleave(nodes: List[int]) -> None:
+    """Interleave this thread's future page allocations across ``nodes`` (raises OSError on failure)."""
+    import ctypes
+    nr = _SET_MEMPOLICY_SYSCALL.get(platform.machine())
+    if platform.system() != "Linux" or nr is None:
+        raise OSError(f"set_mempolicy not supported on {platform.system()} {platform.machine()}")
+    words = max(nodes) // 64 + 1
+    mask = (ctypes.c_ulong * words)()
+    for node in nodes:
+        mask[node // 64] |= 1 << (node % 64)
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+    # maxnode counts bits plus one: the kernel discards the last bit (as libnuma does)
+    if libc.syscall(ctypes.c_long(nr), ctypes.c_int(_MPOL_INTERLEAVE), mask, ctypes.c_ulong(words * 64 + 1)) != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+
+
+def configure_cpu_fill(cpus, interleave: bool, log, node_dir: str = "/sys/devices/system/node") -> List[int]:
+    """Set where ``random_operand`` fills CPU operands; return the NUMA nodes they interleave across.
+
+    Linux places a page on the node of the thread that first writes it.  The fill threads run on
+    ``cpus`` and, with ``interleave``, take an interleave memory policy, so operand pages spread
+    evenly across the run's NUMA nodes instead of piling onto one, so cores on other sockets don't
+    read them remotely.  Only the fill threads get the policy: interleaving everything, as
+    ``numactl --interleave=all`` does, also spreads the BLAS threads' private buffers, which slows
+    fp32 GEMM markedly.
+    """
+    global _CPU_FILL_PLACEMENT
+    nodes = numa_nodes_for_cpus(cpus, node_dir) if interleave else []
+    if len(nodes) < 2:
+        nodes = []
+    elif not _interleave_works(nodes):
+        log.warning(f"CPU operands: could not interleave across NUMA nodes {format_cpu_list(nodes)}; "
+                    f"filling with the default (local) placement")
+        nodes = []
+    _CPU_FILL_PLACEMENT = (sorted(cpus), nodes)
+    if nodes:
+        log.info(f"CPU operands: interleaved across NUMA nodes {format_cpu_list(nodes)} "
+                 f"(--no-cpu-interleave to disable)")
+    return nodes
+
+
+def _interleave_works(nodes: List[int]) -> bool:
+    """Try the policy on a throwaway thread (a policy is per thread, so this changes nothing else)."""
+    result = []
+
+    def probe():
+        try:
+            _set_mempolicy_interleave(nodes)
+            result.append(True)
+        except OSError as e:
+            logging.debug(f"set_mempolicy failed: {e}")
+
+    t = threading.Thread(target=probe)
+    t.start()
+    t.join()
+    return bool(result)
 
 
 def get_available_memory_mb(device: torch.device) -> float:
@@ -2859,8 +3679,8 @@ def batched_gemm_test(a, dev, log, tel, tel_thread, prn):
         dev_lbl = device_label(dev, gpu_id)
         log.info(f"[{dev_lbl} GEMM] Allocating tensors ({B}x{M}x{K} + {B}x{K}x{N})...")
         A, Bm = (
-            torch.rand(B, M, K, device=dev, dtype=dtype),
-            torch.rand(B, K, N, device=dev, dtype=dtype),
+            random_operand((B, M, K), dtype, dev),
+            random_operand((B, K, N), dtype, dev),
         )
         flops = 2 * B * M * N * K * (4 if dtype.is_complex else 1)
 
@@ -3633,8 +4453,8 @@ def _prepare_melt_workload(a, dev, log, tag: str) -> _MeltWorkload:
     B, M, N, K = _melt_dims(a)
 
     log.info(f"{tag} Allocating tensors ({B}x{M}x{K} + {B}x{K}x{N}, {dtype_str})...")
-    A = torch.rand(B, M, K, device=dev, dtype=dtype)
-    Bm = torch.rand(B, K, N, device=dev, dtype=dtype)
+    A = random_operand((B, M, K), dtype, dev)
+    Bm = random_operand((B, K, N), dtype, dev)
     cool_gap = _make_melt_cool_gap(A, Bm, dev, log, tag)
 
     log.info(f"{tag} Warmup ({a.warmup} iterations)...")
@@ -3792,7 +4612,7 @@ def convolution_test(a, dev, log, tel, tel_thread, prn):
         dtype_str = str(dtype).split(".")[-1]
         dev_lbl = device_label(dev, gpu_id)
         log.info(f"[{dev_lbl} Conv] Allocating tensors ({B}x{Ci}x{H}x{W})...")
-        x = torch.rand(B, Ci, H, W, device=dev, dtype=dtype)
+        x = random_operand((B, Ci, H, W), dtype, dev)
         conv = torch.nn.Conv2d(Ci, Co, K).to(dev, dtype=dtype)
         log.info(f"[{dev_lbl} Conv] Warmup ({a.warmup} iterations)...")
         for _ in range(a.warmup):
@@ -3869,7 +4689,7 @@ def fft_test(a, dev, log, tel, tel_thread, prn):
             return None
 
         log.info(f"[{dev_lbl} FFT] Allocating tensors ({B}x{NX}x{NY}x{NZ})...")
-        x = torch.rand(B, NX, NY, NZ, device=dev, dtype=dtype)
+        x = random_operand((B, NX, NY, NZ), dtype, dev)
         # FFT flops: 5*N*log2(N) per dimension - assumes power-of-2 for radix-2 FFT
         # Non-power-of-2 uses Bluestein/mixed-radix (formula is approximate)
         flops = 5 * B * NX * NY * NZ * (NX.bit_length() - 1)
@@ -3934,8 +4754,8 @@ def einsum_test(a, dev, log, tel, tel_thread, prn):
         dev_lbl = device_label(dev, gpu_id)
 
         log.info(f"[{dev_lbl} Einsum] Allocating tensors ({B}x{H}x{Q}x{D})...")
-        q = torch.rand(B, H, Q, D, device=dev, dtype=dtype)
-        k = torch.rand(B, H, Q, D, device=dev, dtype=dtype)
+        q = random_operand((B, H, Q, D), dtype, dev)
+        k = random_operand((B, H, Q, D), dtype, dev)
         flops = 2 * B * H * Q * Q * D
 
         log.info(f"[{dev_lbl} Einsum] Warmup ({a.warmup} iterations)...")
@@ -3998,7 +4818,7 @@ def memory_traffic_test(a, dev, log, tel, tel_thread, prn):
         dtype_str = str(dtype).split(".")[-1]
 
         log.info(f"[{dev_lbl} Memory] Allocating tensor ({N} elements)...")
-        data = torch.rand(N, device=dev, dtype=dtype)
+        data = random_operand((N,), dtype, dev)
         log.info(f"[{dev_lbl} Memory] Starting {a.memory_pattern} pattern test...")
         
         # Define access pattern based on --memory-pattern
@@ -4080,7 +4900,7 @@ def laplacian_heat_equation(a, dev, log, tel, tel_thread, prn):
         dtype_str = str(dtype).split(".")[-1]
 
         log.info(f"[{dev_lbl} Heat] Allocating grid ({N}x{N})...")
-        u = torch.rand(N, N, device=dev, dtype=dtype)
+        u = random_operand((N, N), dtype, dev)
         coeff = a.alpha * a.delta_t
         log.info(f"[{dev_lbl} Heat] Starting simulation ({steps} time steps)...")
 
@@ -4414,7 +5234,8 @@ def sparse_mm_test(a, dev, log, tel, tel_thread, prn):
         col_indices = torch.randint(0, K, (nnz,), device=dev)
         indices = torch.stack([row_indices, col_indices])
         log.info(f"[{dev_lbl} Sparse MM] Allocating value tensor...")
-        values = torch.rand(nnz, device=dev, dtype=dtype)
+        # CPU sparse.mm runs on one thread, which pays for every remote page: keep its operands local
+        values = random_operand((nnz,), dtype, dev, spread=False)
         
         log.info(f"[{dev_lbl} Sparse MM] Creating sparse COO tensor...")
         sparse_A = torch.sparse_coo_tensor(indices, values, (M, K))
@@ -4423,7 +5244,7 @@ def sparse_mm_test(a, dev, log, tel, tel_thread, prn):
         
         # Dense matrix B
         log.info(f"[{dev_lbl} Sparse MM] Allocating dense B matrix ({K}x{N})...")
-        dense_B = torch.rand(K, N, device=dev, dtype=dtype)
+        dense_B = random_operand((K, N), dtype, dev, spread=False)
         
         # Actual nnz after coalesce (duplicates removed)
         actual_nnz = sparse_A._nnz()
@@ -4766,6 +5587,8 @@ def build_parser():
     p.add_argument("--gpu-list", type=str, help="Comma-separated GPU indices (e.g., '0,2,3')")
     p.add_argument("--cpu-affinity", action="store_true", default=True, help="Enable NUMA-aware CPU binding (default: enabled)")
     p.add_argument("--no-cpu-affinity", action="store_false", dest="cpu_affinity", help="Disable NUMA-aware CPU binding")
+    p.add_argument("--no-cpu-interleave", action="store_false", dest="cpu_interleave",
+                   help="CPU runs: don't interleave memory across the run's NUMA nodes (default: interleave)")
     p.add_argument("--cpu-gpu-map", type=str, help="Manual CPU-GPU mapping (e.g., '0:0-15,1:16-31')")
     p.add_argument("--cpu-list", type=str, help="CPU cores for CPU-only mode (e.g., '0-23,48-71' or 'all'). Default: all physical cores")
     p.add_argument("--parent-cpu", type=int, default=None, help="Pin parent process to specific CPU core (default: last core of first NUMA node, -1 to disable)")
