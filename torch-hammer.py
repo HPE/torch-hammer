@@ -1106,7 +1106,9 @@ CPU_SET_REFRESH_S = 5.0  # Re-read the process CPU set this often; --cpu-list bi
 _CPU_ZONE_TYPE_HINTS = ("cpu", "pkg", "package", "soc")  # thermal_zone types that describe the CPU
 # ARM CPUs report only numeric IDs in /proc/cpuinfo ("CPU implementer", "CPU part"), so their names come
 # from these tables.  Only cores torch-hammer has been tested on are listed; others are reported by their
-# raw IDs.  To name a core you have tested, add its IDs here (grep -m2 -E "implementer|part" /proc/cpuinfo).
+# raw IDs.  To name a core you have tested, add its IDs here (grep -m2 -E "implementer|part" /proc/cpuinfo);
+# the Linux kernel lists known IDs as ARM_CPU_IMP_* / *_CPU_PART_* in arch/arm64/include/asm/cputype.h
+# (https://github.com/torvalds/linux/blob/master/arch/arm64/include/asm/cputype.h).
 _ARM_IMPLEMENTERS = {0x41: "ARM"}
 _ARM_PARTS = {(0x41, 0xd4f): "Neoverse-V2"}  # NVIDIA Grace
 _LEADING_NUMBER_RE = re.compile(r"^\s*(-?\d+(?:\.\d+)?)")  # also parses pm_counters "312 W 1730... us"
