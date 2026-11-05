@@ -18,6 +18,10 @@ import reframe as rfm
 import reframe.utility.sanity as sn
 
 
+# Device label in torch-hammer's '[<label> <benchmark>]' lines: GPU0..N, or CPU / MPS without a GPU
+DEVICE = r'(?:GPU\d+|CPU|MPS)'
+
+
 def _no_traceback(check):
     """A Python traceback in either output stream is never an acceptable outcome.
 
@@ -115,7 +119,7 @@ class TorchHammerGEMM(TorchHammerBase):
         Output format: [GPU{id} Batched GEMM] Performance: {min} / {mean} / {max} GFLOP/s
         """
         return sn.extractsingle(
-            r'\[GPU\d+\s+Batched GEMM\]\s+Performance:\s+[\d.]+\s*/\s*([\d.]+)\s*/\s*[\d.]+\s+GFLOP/s',
+            rf'\[{DEVICE}\s+Batched GEMM\]\s+Performance:\s+[\d.]+\s*/\s*([\d.]+)\s*/\s*[\d.]+\s+GFLOP/s',
             self.stdout, 1, float
         )
     
@@ -123,7 +127,7 @@ class TorchHammerGEMM(TorchHammerBase):
     def gemm_gflops_min(self):
         """Extract minimum GEMM performance."""
         return sn.extractsingle(
-            r'\[GPU\d+\s+Batched GEMM\]\s+Performance:\s+([\d.]+)\s*/\s*[\d.]+\s*/\s*[\d.]+\s+GFLOP/s',
+            rf'\[{DEVICE}\s+Batched GEMM\]\s+Performance:\s+([\d.]+)\s*/\s*[\d.]+\s*/\s*[\d.]+\s+GFLOP/s',
             self.stdout, 1, float
         )
     
@@ -131,7 +135,7 @@ class TorchHammerGEMM(TorchHammerBase):
     def gemm_gflops_max(self):
         """Extract maximum GEMM performance."""
         return sn.extractsingle(
-            r'\[GPU\d+\s+Batched GEMM\]\s+Performance:\s+[\d.]+\s*/\s*[\d.]+\s*/\s*([\d.]+)\s+GFLOP/s',
+            rf'\[{DEVICE}\s+Batched GEMM\]\s+Performance:\s+[\d.]+\s*/\s*[\d.]+\s*/\s*([\d.]+)\s+GFLOP/s',
             self.stdout, 1, float
         )
 
@@ -175,7 +179,7 @@ class TorchHammerConvolution(TorchHammerBase):
         Output format: [GPU{id} Convolution] Performance: {min} / {mean} / {max} img/s
         """
         return sn.extractsingle(
-            r'\[GPU\d+\s+Convolution\]\s+Performance:\s+[\d.]+\s*/\s*([\d.]+)\s*/\s*[\d.]+\s+img/s',
+            rf'\[{DEVICE}\s+Convolution\]\s+Performance:\s+[\d.]+\s*/\s*([\d.]+)\s*/\s*[\d.]+\s+img/s',
             self.stdout, 1, float
         )
 
@@ -213,7 +217,7 @@ class TorchHammerFFT(TorchHammerBase):
         Output format: [GPU{id} 3D FFT] Performance: {min} / {mean} / {max} GFLOP/s
         """
         return sn.extractsingle(
-            r'\[GPU\d+\s+3D FFT\]\s+Performance:\s+[\d.]+\s*/\s*([\d.]+)\s*/\s*[\d.]+\s+GFLOP/s',
+            rf'\[{DEVICE}\s+3D FFT\]\s+Performance:\s+[\d.]+\s*/\s*([\d.]+)\s*/\s*[\d.]+\s+GFLOP/s',
             self.stdout, 1, float
         )
 
@@ -253,7 +257,7 @@ class TorchHammerEinsum(TorchHammerBase):
         Output format: [GPU{id} Einsum Attention] Performance: {min} / {mean} / {max} GFLOP/s
         """
         return sn.extractsingle(
-            r'\[GPU\d+\s+Einsum Attention\]\s+Performance:\s+[\d.]+\s*/\s*([\d.]+)\s*/\s*[\d.]+\s+GFLOP/s',
+            rf'\[{DEVICE}\s+Einsum Attention\]\s+Performance:\s+[\d.]+\s*/\s*([\d.]+)\s*/\s*[\d.]+\s+GFLOP/s',
             self.stdout, 1, float
         )
 
@@ -289,7 +293,7 @@ class TorchHammerMemory(TorchHammerBase):
         Output format: [GPU{id} Memory Traffic] Performance: {min} / {mean} / {max} GB/s
         """
         return sn.extractsingle(
-            r'\[GPU\d+\s+Memory Traffic\]\s+Performance:\s+[\d.]+\s*/\s*([\d.]+)\s*/\s*[\d.]+\s+GB/s',
+            rf'\[{DEVICE}\s+Memory Traffic\]\s+Performance:\s+[\d.]+\s*/\s*([\d.]+)\s*/\s*[\d.]+\s+GB/s',
             self.stdout, 1, float
         )
 
@@ -325,7 +329,7 @@ class TorchHammerHeat(TorchHammerBase):
         Output format: [GPU{id} Heat Equation] Performance: {min} / {mean} / {max} MLUPS
         """
         return sn.extractsingle(
-            r'\[GPU\d+\s+Heat Equation\]\s+Performance:\s+[\d.]+\s*/\s*([\d.]+)\s*/\s*[\d.]+\s+MLUPS',
+            rf'\[{DEVICE}\s+Heat Equation\]\s+Performance:\s+[\d.]+\s*/\s*([\d.]+)\s*/\s*[\d.]+\s+MLUPS',
             self.stdout, 1, float
         )
 
@@ -363,7 +367,7 @@ class TorchHammerSchrodinger(TorchHammerBase):
         Output format: [GPU{id} Schrödinger Equation] Performance: {min} / {mean} / {max} iter/s
         """
         return sn.extractsingle(
-            r'\[GPU\d+\s+Schr.dinger Equation\]\s+Performance:\s+[\d.]+\s*/\s*([\d.]+)\s*/\s*[\d.]+\s+iter/s',
+            rf'\[{DEVICE}\s+Schr.dinger Equation\]\s+Performance:\s+[\d.]+\s*/\s*([\d.]+)\s*/\s*[\d.]+\s+iter/s',
             self.stdout, 1, float
         )
 
@@ -401,7 +405,7 @@ class TorchHammerAtomic(TorchHammerBase):
         Output format: [GPU{id} Atomic Contention] Performance: {min} / {mean} / {max} Mops/s
         """
         return sn.extractsingle(
-            r'\[GPU\d+\s+Atomic Contention\]\s+Performance:\s+[\d.]+\s*/\s*([\d.]+)\s*/\s*[\d.]+\s+Mops/s',
+            rf'\[{DEVICE}\s+Atomic Contention\]\s+Performance:\s+[\d.]+\s*/\s*([\d.]+)\s*/\s*[\d.]+\s+Mops/s',
             self.stdout, 1, float
         )
 
@@ -441,7 +445,7 @@ class TorchHammerSparse(TorchHammerBase):
         Output format: [GPU{id} Sparse MM] Performance: {min} / {mean} / {max} GFLOP/s
         """
         return sn.extractsingle(
-            r'\[GPU\d+\s+Sparse MM\]\s+Performance:\s+[\d.]+\s*/\s*([\d.]+)\s*/\s*[\d.]+\s+GFLOP/s',
+            rf'\[{DEVICE}\s+Sparse MM\]\s+Performance:\s+[\d.]+\s*/\s*([\d.]+)\s*/\s*[\d.]+\s+GFLOP/s',
             self.stdout, 1, float
         )
 
@@ -488,28 +492,28 @@ class TorchHammerFullSuite(TorchHammerBase):
     @performance_function('GFLOP/s')
     def gemm_perf(self):
         return sn.extractsingle(
-            r'\[GPU\d+\s+Batched GEMM\]\s+Performance:\s+[\d.]+\s*/\s*([\d.]+)\s*/\s*[\d.]+\s+GFLOP/s',
+            rf'\[{DEVICE}\s+Batched GEMM\]\s+Performance:\s+[\d.]+\s*/\s*([\d.]+)\s*/\s*[\d.]+\s+GFLOP/s',
             self.stdout, 1, float
         )
     
     @performance_function('img/s')
     def conv_perf(self):
         return sn.extractsingle(
-            r'\[GPU\d+\s+Convolution\]\s+Performance:\s+[\d.]+\s*/\s*([\d.]+)\s*/\s*[\d.]+\s+img/s',
+            rf'\[{DEVICE}\s+Convolution\]\s+Performance:\s+[\d.]+\s*/\s*([\d.]+)\s*/\s*[\d.]+\s+img/s',
             self.stdout, 1, float
         )
     
     @performance_function('GFLOP/s')
     def fft_perf(self):
         return sn.extractsingle(
-            r'\[GPU\d+\s+3D FFT\]\s+Performance:\s+[\d.]+\s*/\s*([\d.]+)\s*/\s*[\d.]+\s+GFLOP/s',
+            rf'\[{DEVICE}\s+3D FFT\]\s+Performance:\s+[\d.]+\s*/\s*([\d.]+)\s*/\s*[\d.]+\s+GFLOP/s',
             self.stdout, 1, float
         )
     
     @performance_function('GB/s')
     def mem_perf(self):
         return sn.extractsingle(
-            r'\[GPU\d+\s+Memory Traffic\]\s+Performance:\s+[\d.]+\s*/\s*([\d.]+)\s*/\s*[\d.]+\s+GB/s',
+            rf'\[{DEVICE}\s+Memory Traffic\]\s+Performance:\s+[\d.]+\s*/\s*([\d.]+)\s*/\s*[\d.]+\s+GB/s',
             self.stdout, 1, float
         )
 

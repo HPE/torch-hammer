@@ -256,6 +256,7 @@ The most important switches are summarised below (defaults in _italics_).
 | **CPU Affinity & NUMA** | |
 | `--cpu-affinity` | NUMA-aware CPU binding (default: _enabled_, Linux only). |
 | `--no-cpu-affinity` | Disable NUMA-aware CPU binding. |
+| `--no-cpu-interleave` | CPU runs: don't spread benchmark operands across the run's NUMA nodes (default: spread). |
 | `--cpu-gpu-map <mapping>` | Manual CPU-GPU binding (e.g., `0:0-15,1:16-31`). |
 | `--cpu-list <cores>` | CPU cores for CPU-only mode (e.g., `0-23,48-71` or `all`). Default: all physical cores. |
 | `--parent-cpu <int>` | Pin parent process to a specific CPU core (default: last core of first NUMA node; `-1` to disable). |
@@ -925,9 +926,46 @@ aggregate pass/fail counts using the `torch-hammer-mgpu` syslog tag.
 |----------|--------------|------------------|
 | NVIDIA GPU | `pynvml` (nvidia-ml-py) | power, temperature, GPU utilization, clock, memory controller activity, memory utilization, GPU temperature, SM utilization, HBM temperature, thermal throttling status, power limit warnings, ECC errors |
 | AMD ROCm GPU/APU | `amdsmi` Python library | GPU utilization, memory utilization, GPU clock, memory clock, power, temperature (edge/hotspot/memory), serial, throttle status, power cap, thermal warnings |
-| CPU only | None | Vendor, architecture |
+| CPU only (Linux) | None | CPU model and vendor, utilization, clock, temperature, power, memory; per-socket values on multi-socket nodes |
+| CPU only (macOS/Windows), MPS | None | Vendor, architecture |
 
 \* AMD telemetry uses native `amdsmi` Python API for ROCm 6.1+ with comprehensive metrics including throttle detection, power limit monitoring, and thermal warnings. Per-processor-type field sets automatically adapt for GPU vs CPU/APU.
+
+### CPU telemetry on Linux
+
+On CPU runs, torch-hammer reads `/proc` and `/sys` directly. Each source is checked once at startup; a missing or unreadable source is left out, never an error. GPU runs don't read these files.
+
+| Field | Source |
+|-------|--------|
+| `model`, `vendor` | `/proc/cpuinfo` (`model name`, `vendor_id`; ARM implementer and part, e.g. `ARM Neoverse-V2`) |
+| `cpu_util` | `/proc/stat`, per physical core: a core is as busy as its busiest hardware thread, so idle SMT siblings don't halve a saturated core. Refreshed once per second (parsing it for hundreds of CPUs stalls Python); power, temperature and memory follow `--telemetry-interval-ms` |
+| `cpu_clock` | `cpufreq/scaling_cur_freq` in MHz, averaged over at most 8 sampled cores per socket; `/proc/cpuinfo` under `acpi-cpufreq` (see below) |
+| `temp_cpu_C` | hwmon `coretemp` (Intel), `k10temp`/`zenpower` (AMD, `Tdie` preferred over `Tctl`), else CPU `thermal_zone*` |
+| `power_W` | first readable of: RAPL `/sys/class/powercap/intel-rapl:N/energy_uj`; AMD HSMP hwmon `amd_hsmp_hwmon/power1_input` (per socket); other hwmon CPU power sensors; Cray `/sys/cray/pm_counters/cpu_power` (or `cpuN_power`) |
+| `power_cap_W` | AMD HSMP hwmon `power1_cap` per socket, summed like `power_W`; read every 5 s |
+| `mem_used_MB`, `mem_total_MB`, `mem_free_MB` | `/proc/meminfo` (`MemTotal`, `MemAvailable`) |
+
+**ARM CPU names.** ARM CPUs report only numeric IDs in `/proc/cpuinfo` (`CPU implementer`, `CPU part`). torch-hammer names the cores it has been tested on, currently NVIDIA Grace (`0x41`/`0xd4f`, `ARM Neoverse-V2`), and shows any other CPU by its raw IDs (e.g. `ARM part 0x…`). To name a CPU you have tested, add its IDs to `_ARM_IMPLEMENTERS` / `_ARM_PARTS` in `torch-hammer.py` and open a pull request.
+
+**Multi-socket nodes.** Sockets come from `topology/physical_package_id`. The totals cover the CPUs any of the benchmark's threads may run on (re-read every 5 s and whenever the thread count changes, so `--cpu-list` and OpenMP worker start-up are picked up; OpenMP pinning the main thread to one core doesn't shrink it): utilization and clock are averaged, temperature is the hottest socket, and power is summed. Per-socket fields (`cpu_util_s0`, `cpu_clock_s1`, `temp_cpu_C_s1`, `power_W_s0`, ...) describe each whole socket, used or not, and are added when each sensor can be matched to its socket. `pm_counters/cpu_power` is a node total and includes sockets the benchmark doesn't use.
+
+**Clock accuracy.** With the `acpi-cpufreq` driver, `scaling_cur_freq` reports the requested P-state (flat at the base clock while cores boost well above it), so torch-hammer reads the delivered clock from `/proc/cpuinfo` instead, at most once per second because that file is large on many-core nodes. Each physical core reports its busiest hardware thread. Other drivers use `scaling_cur_freq`.
+
+**Power sources and permissions.** Standard Linux sources come first. RAPL `energy_uj` (and `amd_energy`) have been root-only on most distributions since Linux 5.10; a site can grant read access with a udev rule. On AMD EPYC, `amd_hsmp_hwmon` is usually world-readable and reports each socket's power and power cap as seen by the SMU. Cray `pm_counters` is the last fallback; it measures at the board and includes voltage-regulator losses, so it reads higher than HSMP.
+
+### CPU operand fill and NUMA placement
+
+`torch.rand` fills CPU tensors on one thread, and Linux places each page on the NUMA node of the thread that first writes it. Left alone, large operands take seconds to minutes to create and all land on one NUMA node, so cores on the other sockets read them remotely.
+
+On CPU runs, torch-hammer therefore fills benchmark operands in fixed-size chunks across all of the run's threads, and those fill threads interleave the pages across the NUMA nodes of the run's CPUs (CPU-less memory nodes such as CXL are skipped). Only the operands are interleaved; the math library's own buffers keep the default local placement. `--no-cpu-interleave` keeps the parallel fill but drops the interleave. GPU runs are unchanged and still call `torch.rand` on the device.
+
+Sparse MM is the exception: PyTorch runs CPU sparse × dense on a single thread, which pays for every remote page, so its operands are filled on that thread and stay on its NUMA node.
+
+On a multi-socket node this keeps every socket busy during large GEMMs, and operand setup drops from seconds to well under a second.
+
+Interleaving everything with `numactl` also spreads the math library's private buffers, which slows fp32 GEMM markedly, so don't launch torch-hammer under `numactl --interleave=all`.
+
+Values stay reproducible: each chunk has its own generator seeded from PyTorch's default CPU generator, so `torch.manual_seed` gives the same operands whatever the thread count. They aren't the same values `torch.rand` would produce for that seed.
 
 ---
 
